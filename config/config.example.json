@@ -1,0 +1,36 @@
+{
+  "xmpp": {
+    "server": "192.168.2.201",
+    "port": 5222,
+    "username": "user@domain",
+    "password": "",
+    "use_tls": true,
+    "verify_tls": true
+  },
+  "rest_api": {
+    "host": "127.0.0.1",
+    "port": 8080,
+    "endpoint": "/send_message",
+    "api_key": "change-me-to-a-long-random-string",
+    "allow_get": false
+  },
+  "kafka": {
+    "enabled": false,
+    "bootstrap_servers": "localhost:9092",
+    "topics": {
+      "messages": "xmpp-messages",
+      "api_requests": "xmpp-api-requests",
+      "events": "xmpp-events"
+    },
+    "consumer_group": "xmpp-client",
+    "use_for_api_queue": true,
+    "consume_api_requests": true,
+    "auto_offset_reset": "latest",
+    "publish_all_messages": true,
+    "publish_api_requests": true
+  },
+  "logging": {
+    "retention_days": 14
+  }
+}
+

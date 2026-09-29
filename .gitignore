@@ -1,0 +1,19 @@
+# Реальный конфиг с паролем и API-ключом — не коммитить.
+# В репозитории должен быть только config/config.example.json с плейсхолдерами.
+config/config.json
+.env
+
+# Логи и БД
+logs/
+*.db
+*.db.bak-v*
+
+# Python
+__pycache__/
+*.pyc
+.pytest_cache/
+venv/
+*.egg-info/
+
+# Служебное
+quick_report.txt
