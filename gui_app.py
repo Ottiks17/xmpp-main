@@ -1,14 +1,114 @@
-import sys
+# -*- coding: utf-8 -*-
+"""
+XMPP Мессенджер — десктопный GUI на PyQt5 (дизайн в стиле Telegram Desktop).
+
+Вся XMPP/REST/Kafka/история-логика (XMPPGUI, XmppConnectWorker, message_handler
+внутри start_rest, работа с self.chats/self.chats_lock/self.pending_messages,
+обработка межпоточных сигналов) перенесена из предыдущей версии этого файла
+БЕЗ ИЗМЕНЕНИЙ. Переписан только слой отображения: вместо QTabWidget теперь
+список чатов + переписка в стиле Telegram, с диалогами Настроек/Истории/Логов,
+открываемыми по требованию из меню гамбургера (см. XMPPGUI.init_ui).
+
+Файл построен из нескольких логических разделов (помечены заголовками ниже),
+раньше они были отдельными модулями пакета ui/ — теперь всё в одном файле
+gui_app.py по прямому указанию: тема оформления, делегаты/виджеты списка
+чатов и переписки, панель профиля, диалоги настроек/истории/логов и, в самом
+конце, собственно класс XMPPGUI.
+
+ЧТО СОХРАНЕНО БЕЗ ИЗМЕНЕНИЙ (имена, сигнатуры, поведение):
+  Сигналы: sig_received_message, sig_delivery_received, sig_receipt_received,
+           sig_send_failed, sig_log, sig_message_sent.
+  Атрибуты: self.chats, self.chats_lock, self.current_contact,
+           self.pending_messages, self.pending_messages_lock,
+           self.xmpp_service, self.rest_server, self.kafka_broker,
+           self.logger, self.config.
+  Методы (имя + внешнее поведение): connect_xmpp, send_chat_message,
+           receive_message, on_delivery_received, on_receipt_received,
+           on_send_failed, log_callback, refresh_chats_list,
+           refresh_chat_display, load_chat_history, save_chat_history,
+           update_message_status, mark_messages_as_read,
+           _process_received_message, _on_delivery_received_safe,
+           _on_receipt_received_safe, _on_send_failed_safe,
+           _log_callback_safe, _on_message_sent_safe.
+  Класс XmppConnectWorker — скопирован дословно.
+  Правило потоков: обращение к GUI из не-главного потока — ТОЛЬКО через
+           emit сигнала (как и было).
+
+ЧТО ИЗМЕНИЛОСЬ ПО СУЩЕСТВУ (сознательно, не баг) — подробности см. в
+докстринге класса XMPPGUI ниже, перед init_ui().
+"""
+
+import hashlib
+import html
 import json
 import os
 import sqlite3
-import html
+import sys
 import uuid
 from datetime import datetime
 from threading import Lock
-from PyQt5.QtWidgets import *
-from PyQt5.QtCore import *
-from PyQt5.QtGui import *
+
+from PyQt5.QtCore import (
+    QAbstractListModel,
+    QEasingCurve,
+    QModelIndex,
+    QPointF,
+    QPropertyAnimation,
+    QRect,
+    QRectF,
+    QSize,
+    Qt,
+    QThread,
+    QTimer,
+    pyqtSignal,
+    pyqtSlot,
+)
+from PyQt5.QtGui import (
+    QColor,
+    QFont,
+    QFontMetrics,
+    QPainter,
+    QPainterPath,
+    QPixmap,
+    QStandardItem,
+    QStandardItemModel,
+    QTextLayout,
+    QTextOption,
+)
+from PyQt5.QtWidgets import (
+    QAbstractItemView,
+    QApplication,
+    QCheckBox,
+    QComboBox,
+    QDialog,
+    QDialogButtonBox,
+    QFormLayout,
+    QHBoxLayout,
+    QHeaderView,
+    QInputDialog,
+    QLabel,
+    QLineEdit,
+    QListView,
+    QListWidget,
+    QListWidgetItem,
+    QMainWindow,
+    QMenu,
+    QMessageBox,
+    QPushButton,
+    QScrollArea,
+    QSpinBox,
+    QSplitter,
+    QStackedWidget,
+    QStatusBar,
+    QStyledItemDelegate,
+    QStyleOptionViewItem,
+    QTableWidget,
+    QTableWidgetItem,
+    QTextEdit,
+    QToolButton,
+    QVBoxLayout,
+    QWidget,
+)
 
 from app.config import load_config, save_config as write_config
 from app.constants import CHAT_HISTORY_PATH, MAX_MESSAGE_LENGTH
@@ -21,8 +121,1565 @@ from logger import MessageLogger
 os.environ['LANG'] = 'ru_RU.UTF-8'
 
 
+# ======================================================================
+# 1. ТЕМА ОФОРМЛЕНИЯ (было ui/theme.py)
+# ======================================================================
+
+TELEGRAM_DARK: dict[str, str] = {
+    "bg_primary": "#17212b",     # фон окна чата
+    "bg_secondary": "#0e1621",   # левая панель (список чатов)
+    "bg_input": "#17212b",       # фон поля ввода / шапки
+    "bg_hover": "#202b36",       # ховер по элементу списка / кнопке
+    "bg_selected": "#2b5278",    # выбранный чат в списке
+    "bubble_sent": "#2b5278",    # пузырь исходящего сообщения
+    "bubble_recv": "#182533",    # пузырь входящего сообщения
+    "accent": "#5288c1",         # акцентный цвет (ссылки, активные элементы)
+    "text_primary": "#ffffff",   # основной текст
+    "text_secondary": "#7f91a4", # вторичный текст (время, статус, превью)
+    "divider": "#101921",        # разделительные линии
+    "online": "#4dcd5e",         # индикатор "в сети"
+    "error": "#e53935",          # ошибки, недоставленные сообщения
+}
+
+
+def build_qss() -> str:
+    """Собирает единый QSS для всего приложения из TELEGRAM_DARK.
+
+    Возвращает готовую строку для self.setStyleSheet(). Все цвета берутся
+    только из TELEGRAM_DARK — при смене темы достаточно поменять словарь.
+    """
+    c = TELEGRAM_DARK
+
+    return f"""
+    /* ---------- Базовые контейнеры ---------- */
+    QMainWindow#MainWindow {{
+        background-color: {c['bg_primary']};
+    }}
+
+    QWidget {{
+        background-color: {c['bg_primary']};
+        color: {c['text_primary']};
+        font-family: "Segoe UI", "Noto Sans", sans-serif;
+        font-size: 10pt;
+    }}
+
+    QSplitter::handle {{
+        background-color: {c['divider']};
+        width: 1px;
+    }}
+
+    /* ---------- Левая панель (список чатов) ---------- */
+    QWidget#Sidebar {{
+        background-color: {c['bg_secondary']};
+        border: none;
+    }}
+
+    QToolButton#SidebarMenuButton,
+    QToolButton#SidebarNewChatButton {{
+        background: transparent;
+        border: none;
+        border-radius: 18px;
+        padding: 6px;
+    }}
+    QToolButton#SidebarMenuButton:hover,
+    QToolButton#SidebarNewChatButton:hover {{
+        background-color: {c['bg_hover']};
+    }}
+
+    QLineEdit#SidebarSearch {{
+        background-color: {c['bg_hover']};
+        border: none;
+        border-radius: 16px;
+        padding: 6px 12px;
+        color: {c['text_primary']};
+        selection-background-color: {c['accent']};
+    }}
+    QLineEdit#SidebarSearch:focus {{
+        border: 1px solid {c['accent']};
+    }}
+
+    QListView#ChatListView {{
+        background-color: {c['bg_secondary']};
+        border: none;
+        outline: none;
+    }}
+    /* Фон hover/selected для строк списка рисует ChatListDelegate вручную
+       (нужен полный контроль над формой аватара и бейджа), поэтому здесь
+       item-селекторы намеренно не заданы. */
+
+    /* ---------- Правая панель (чат) ---------- */
+    QWidget#ChatView {{
+        background-color: {c['bg_primary']};
+    }}
+
+    QWidget#ChatHeader {{
+        background-color: {c['bg_input']};
+        border-bottom: 1px solid {c['divider']};
+    }}
+
+    QLabel#ChatHeaderName {{
+        font-weight: bold;
+        font-size: 11pt;
+        color: {c['text_primary']};
+    }}
+
+    QLabel#ChatHeaderStatus {{
+        font-size: 9pt;
+        color: {c['text_secondary']};
+    }}
+
+    QListView#MessageListView {{
+        background-color: {c['bg_primary']};
+        border: none;
+        outline: none;
+    }}
+    /* Пузыри сообщений рисует MessageDelegate вручную (см. docstring выше:
+       выравнивание, скругления, галочки статуса) — здесь только фон вьюпорта. */
+
+    /* ---------- Поле ввода ---------- */
+    QWidget#InputBar {{
+        background-color: {c['bg_input']};
+        border-top: 1px solid {c['divider']};
+    }}
+
+    QTextEdit#MessageInput {{
+        background-color: {c['bg_hover']};
+        border: none;
+        border-radius: 18px;
+        padding: 8px 14px;
+        color: {c['text_primary']};
+        selection-background-color: {c['accent']};
+    }}
+
+    QPushButton#SendButton {{
+        background-color: {c['accent']};
+        border: none;
+        border-radius: 18px;
+        color: {c['text_primary']};
+        font-weight: bold;
+    }}
+    QPushButton#SendButton:hover {{
+        background-color: #619bd6;
+    }}
+    QPushButton#SendButton:disabled {{
+        background-color: {c['bg_hover']};
+        color: {c['text_secondary']};
+    }}
+
+    /* ---------- Кнопки-иконки без рамки (flat=true) ---------- */
+    *[flat="true"] {{
+        background: transparent;
+        border: none;
+        border-radius: 16px;
+        padding: 6px;
+        color: {c['text_secondary']};
+    }}
+    *[flat="true"]:hover {{
+        background-color: {c['bg_hover']};
+        color: {c['text_primary']};
+    }}
+
+    /* ---------- Панель профиля ---------- */
+    QWidget#ProfilePanel {{
+        background-color: {c['bg_secondary']};
+        border-left: 1px solid {c['divider']};
+    }}
+
+    QLabel#ProfileJid {{
+        color: {c['text_secondary']};
+        font-size: 9pt;
+    }}
+
+    QPushButton#ProfileDeleteButton {{
+        background: transparent;
+        border: none;
+        color: {c['error']};
+        text-align: left;
+        padding: 10px 16px;
+    }}
+    QPushButton#ProfileDeleteButton:hover {{
+        background-color: {c['bg_hover']};
+    }}
+
+    /* ---------- Диалоги (Настройки / История / Логи) ---------- */
+    QDialog {{
+        background-color: {c['bg_primary']};
+    }}
+
+    QListWidget#SettingsNav {{
+        background-color: {c['bg_secondary']};
+        border: none;
+        border-right: 1px solid {c['divider']};
+        outline: none;
+    }}
+    QListWidget#SettingsNav::item {{
+        padding: 10px 14px;
+        border-radius: 0;
+    }}
+    QListWidget#SettingsNav::item:selected {{
+        background-color: {c['bg_selected']};
+        color: {c['text_primary']};
+    }}
+    QListWidget#SettingsNav::item:hover:!selected {{
+        background-color: {c['bg_hover']};
+    }}
+
+    QStackedWidget#SettingsStack {{
+        background-color: {c['bg_primary']};
+    }}
+
+    /* ---------- Общие элементы форм (используются в SettingsDialog) ---------- */
+    QLineEdit, QSpinBox, QComboBox {{
+        background-color: {c['bg_hover']};
+        border: 1px solid {c['divider']};
+        border-radius: 6px;
+        padding: 6px 10px;
+        color: {c['text_primary']};
+        selection-background-color: {c['accent']};
+    }}
+    QLineEdit:focus, QSpinBox:focus, QComboBox:focus {{
+        border: 1px solid {c['accent']};
+    }}
+
+    QCheckBox {{
+        color: {c['text_primary']};
+        spacing: 8px;
+    }}
+
+    QLabel {{
+        color: {c['text_primary']};
+    }}
+
+    /* ---------- Кнопки общего назначения ---------- */
+    QPushButton {{
+        background-color: {c['bg_hover']};
+        border: none;
+        border-radius: 6px;
+        padding: 8px 16px;
+        color: {c['text_primary']};
+    }}
+    QPushButton:hover {{
+        background-color: #26333f;
+    }}
+    QPushButton:pressed {{
+        background-color: {c['bg_selected']};
+    }}
+    QPushButton:disabled {{
+        color: {c['text_secondary']};
+    }}
+
+    QPushButton[class="primary"] {{
+        background-color: {c['accent']};
+        font-weight: bold;
+    }}
+    QPushButton[class="primary"]:hover {{
+        background-color: #619bd6;
+    }}
+
+    QPushButton[class="secondary"] {{
+        background-color: transparent;
+        border: 1px solid {c['divider']};
+        color: {c['text_secondary']};
+    }}
+    QPushButton[class="secondary"]:hover {{
+        background-color: {c['bg_hover']};
+        color: {c['text_primary']};
+    }}
+
+    /* ---------- Таблицы (HistoryDialog) ---------- */
+    QTableView, QTableWidget {{
+        background-color: {c['bg_primary']};
+        alternate-background-color: {c['bg_secondary']};
+        gridline-color: {c['divider']};
+        border: 1px solid {c['divider']};
+        selection-background-color: {c['bg_selected']};
+        color: {c['text_primary']};
+    }}
+    QTableWidget::item, QTableView::item {{
+        background-color: transparent;
+        color: {c['text_primary']};
+        padding: 4px 6px;
+    }}
+    QTableWidget::item:selected, QTableView::item:selected {{
+        background-color: {c['bg_selected']};
+        color: {c['text_primary']};
+    }}
+    QHeaderView::section {{
+        background-color: {c['bg_secondary']};
+        color: {c['text_secondary']};
+        padding: 6px;
+        border: none;
+        border-bottom: 1px solid {c['divider']};
+    }}
+
+    /* ---------- Логи (LogsDialog) ---------- */
+    QPlainTextEdit, QTextEdit#LogsView {{
+        background-color: {c['bg_secondary']};
+        border: 1px solid {c['divider']};
+        color: {c['text_primary']};
+        font-family: "Consolas", "Courier New", monospace;
+    }}
+
+    /* ---------- Скроллбары (везде) ---------- */
+    QScrollBar:vertical {{
+        background: transparent;
+        width: 10px;
+        margin: 0;
+    }}
+    QScrollBar::handle:vertical {{
+        background: {c['bg_hover']};
+        border-radius: 5px;
+        min-height: 24px;
+    }}
+    QScrollBar::handle:vertical:hover {{
+        background: {c['bg_selected']};
+    }}
+    QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {{
+        height: 0;
+    }}
+    QScrollBar::add-page:vertical, QScrollBar::sub-page:vertical {{
+        background: none;
+    }}
+
+    QScrollBar:horizontal {{
+        background: transparent;
+        height: 10px;
+        margin: 0;
+    }}
+    QScrollBar::handle:horizontal {{
+        background: {c['bg_hover']};
+        border-radius: 5px;
+        min-width: 24px;
+    }}
+    QScrollBar::handle:horizontal:hover {{
+        background: {c['bg_selected']};
+    }}
+    QScrollBar::add-line:horizontal, QScrollBar::sub-line:horizontal {{
+        width: 0;
+    }}
+    QScrollBar::add-page:horizontal, QScrollBar::sub-page:horizontal {{
+        background: none;
+    }}
+
+    /* ---------- QMenu (меню гамбургера, контекстные меню) ---------- */
+    QMenu {{
+        background-color: {c['bg_secondary']};
+        border: 1px solid {c['divider']};
+        padding: 4px;
+    }}
+    QMenu::item {{
+        padding: 8px 24px 8px 12px;
+        border-radius: 4px;
+    }}
+    QMenu::item:selected {{
+        background-color: {c['bg_selected']};
+    }}
+    QMenu::separator {{
+        height: 1px;
+        background: {c['divider']};
+        margin: 4px 8px;
+    }}
+
+    /* ---------- Тултипы ---------- */
+    QToolTip {{
+        background-color: {c['bg_hover']};
+        color: {c['text_primary']};
+        border: 1px solid {c['divider']};
+        padding: 4px 8px;
+    }}
+    """
+
+
+# ======================================================================
+# 2. ЛЕВАЯ ПАНЕЛЬ — СПИСОК ЧАТОВ (было ui/sidebar.py)
+# ======================================================================
+
+# Роли данных в модели списка чатов (поверх стандартных Qt.DisplayRole и т.п.)
+ROLE_JID = Qt.UserRole + 1
+ROLE_PREVIEW = Qt.UserRole + 2
+ROLE_TIME = Qt.UserRole + 3
+ROLE_UNREAD = Qt.UserRole + 4
+
+ROW_HEIGHT = 64
+AVATAR_SIZE = 48
+AVATAR_MARGIN = 8
+
+# Палитра инициалов-аватаров (детерминированная по хешу JID, как в Telegram)
+_AVATAR_COLORS = [
+    "#e17076", "#7bc862", "#e5ca77", "#65aadd",
+    "#a695e7", "#ee7aae", "#6ec9cb", "#faa774",
+]
+
+
+def avatar_color(jid: str) -> QColor:
+    """Стабильный цвет фона аватара по JID — один и тот же контакт всегда одного цвета."""
+    idx = int(hashlib.md5(jid.encode("utf-8")).hexdigest(), 16) % len(_AVATAR_COLORS)
+    return QColor(_AVATAR_COLORS[idx])
+
+
+def initials(jid: str) -> str:
+    """Одна-две буквы для аватара: из части до '@', либо первая буква JID."""
+    local = jid.split("@", 1)[0]
+    parts = [p for p in local.replace(".", " ").replace("_", " ").split(" ") if p]
+    if not parts:
+        return "?"
+    if len(parts) == 1:
+        return parts[0][:2].upper()
+    return (parts[0][0] + parts[1][0]).upper()
+
+
+class ChatListDelegate(QStyledItemDelegate):
+    """Рисует строку списка чатов: аватар-кружок, имя, превью, время, бейдж непрочитанных."""
+
+    def sizeHint(self, option: QStyleOptionViewItem, index: QModelIndex) -> QSize:
+        return QSize(option.rect.width(), ROW_HEIGHT)
+
+    def paint(self, painter: QPainter, option: QStyleOptionViewItem, index: QModelIndex) -> None:
+
+        painter.save()
+        painter.setRenderHint(QPainter.Antialiasing)
+
+        rect: QRect = option.rect
+
+        if option.state & 0x0001:  # QStyle.State_Selected
+            painter.fillRect(rect, QColor(TELEGRAM_DARK["bg_selected"]))
+        elif option.state & 0x0040:  # QStyle.State_MouseOver
+            painter.fillRect(rect, QColor(TELEGRAM_DARK["bg_hover"]))
+
+        jid = index.data(ROLE_JID) or ""
+        name = index.data(Qt.DisplayRole) or jid
+        preview = index.data(ROLE_PREVIEW) or ""
+        time_text = index.data(ROLE_TIME) or ""
+        unread = index.data(ROLE_UNREAD) or 0
+
+        # --- аватар ---
+        ax = rect.left() + AVATAR_MARGIN
+        ay = rect.top() + (rect.height() - AVATAR_SIZE) // 2
+        avatar_rect = QRect(ax, ay, AVATAR_SIZE, AVATAR_SIZE)
+
+        path = QPainterPath()
+        path.addEllipse(avatar_rect.x(), avatar_rect.y(), AVATAR_SIZE, AVATAR_SIZE)
+        painter.fillPath(path, avatar_color(jid))
+
+        painter.setPen(QColor("#ffffff"))
+        avatar_font = QFont(painter.font())
+        avatar_font.setPointSize(13)
+        avatar_font.setBold(True)
+        painter.setFont(avatar_font)
+        painter.drawText(avatar_rect, Qt.AlignCenter, initials(jid))
+
+        # --- текстовая колонка ---
+        text_left = avatar_rect.right() + AVATAR_MARGIN + 4
+        text_right = rect.right() - AVATAR_MARGIN
+        badge_reserved = 28 if unread else 0
+
+        name_font = QFont(painter.font())
+        name_font.setPointSize(10)
+        name_font.setBold(True)
+        painter.setFont(name_font)
+        painter.setPen(QColor(TELEGRAM_DARK["text_primary"]))
+        name_rect = QRect(text_left, rect.top() + 10, text_right - text_left - 60, 20)
+        fm_name = QFontMetrics(name_font)
+        painter.drawText(name_rect, Qt.AlignLeft | Qt.AlignVCenter, fm_name.elidedText(name, Qt.ElideRight, name_rect.width()))
+
+        time_font = QFont(painter.font())
+        time_font.setPointSize(8)
+        painter.setFont(time_font)
+        painter.setPen(QColor(TELEGRAM_DARK["text_secondary"]))
+        time_rect = QRect(text_right - 56, rect.top() + 10, 56, 20)
+        painter.drawText(time_rect, Qt.AlignRight | Qt.AlignVCenter, time_text)
+
+        preview_font = QFont(painter.font())
+        preview_font.setPointSize(9)
+        painter.setFont(preview_font)
+        painter.setPen(QColor(TELEGRAM_DARK["text_secondary"]))
+        preview_rect = QRect(text_left, rect.top() + 34, text_right - text_left - badge_reserved, 20)
+        fm_preview = QFontMetrics(preview_font)
+        painter.drawText(
+            preview_rect, Qt.AlignLeft | Qt.AlignVCenter,
+            fm_preview.elidedText(preview, Qt.ElideRight, preview_rect.width()),
+        )
+
+        # --- бейдж непрочитанных ---
+        if unread:
+            badge_d = 20
+            bx = rect.right() - AVATAR_MARGIN - badge_d
+            by = rect.top() + 36
+            badge_rect = QRect(bx, by, badge_d, badge_d)
+            badge_path = QPainterPath()
+            badge_path.addEllipse(bx, by, badge_d, badge_d)
+            painter.fillPath(badge_path, QColor(TELEGRAM_DARK["accent"]))
+            painter.setPen(QColor("#ffffff"))
+            badge_font = QFont(painter.font())
+            badge_font.setPointSize(7)
+            badge_font.setBold(True)
+            painter.setFont(badge_font)
+            text = str(unread) if unread < 100 else "99+"
+            painter.drawText(badge_rect, Qt.AlignCenter, text)
+
+        painter.restore()
+
+
+class SidebarWidget(QWidget):
+    """Левая панель: гамбургер-меню / поиск / новый чат сверху + список диалогов.
+
+    Не хранит self.chats само по себе — MainWindow вызывает set_chats() при
+    каждом refresh_chats_list(). Это дёшево (список диалогов редко превышает
+    сотни строк), зато не дублирует источник истины.
+    """
+
+    chat_selected = pyqtSignal(str)          # jid выбранного контакта
+    new_chat_requested = pyqtSignal()
+    menu_requested = pyqtSignal()
+    search_text_changed = pyqtSignal(str)
+
+    def __init__(self, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self.setObjectName("Sidebar")
+        self.setFixedWidth(320)
+
+        self._model = QStandardItemModel(self)
+        self._all_jids: list[str] = []  # порядок для поиска/фильтрации
+
+        root = QVBoxLayout(self)
+        root.setContentsMargins(0, 0, 0, 0)
+        root.setSpacing(0)
+
+        top = QWidget(self)
+        top_layout = QHBoxLayout(top)
+        top_layout.setContentsMargins(8, 8, 8, 8)
+        top_layout.setSpacing(6)
+
+        self.menu_btn = QToolButton(top)
+        self.menu_btn.setObjectName("SidebarMenuButton")
+        self.menu_btn.setText("\u2630")  # ☰
+        self.menu_btn.setProperty("flat", "true")
+        self.menu_btn.setToolTip("Меню")
+        self.menu_btn.clicked.connect(self.menu_requested.emit)
+
+        self.search_edit = QLineEdit(top)
+        self.search_edit.setObjectName("SidebarSearch")
+        self.search_edit.setPlaceholderText("\U0001F50D Поиск")
+        self.search_edit.textChanged.connect(self._on_search_changed)
+
+        self.new_chat_btn = QToolButton(top)
+        self.new_chat_btn.setObjectName("SidebarNewChatButton")
+        self.new_chat_btn.setText("\u270F\uFE0F")  # ✏️
+        self.new_chat_btn.setProperty("flat", "true")
+        self.new_chat_btn.setToolTip("Новый чат")
+        self.new_chat_btn.clicked.connect(self.new_chat_requested.emit)
+
+        top_layout.addWidget(self.menu_btn)
+        top_layout.addWidget(self.search_edit, 1)
+        top_layout.addWidget(self.new_chat_btn)
+        root.addWidget(top)
+
+        self.list_view = QListView(self)
+        self.list_view.setObjectName("ChatListView")
+        self.list_view.setModel(self._model)
+        self.list_view.setItemDelegate(ChatListDelegate(self.list_view))
+        self.list_view.setUniformItemSizes(True)
+        self.list_view.setSelectionMode(QAbstractItemView.SingleSelection)
+        self.list_view.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        self.list_view.setMouseTracking(True)  # чтобы работал State_MouseOver в делегате
+        self.list_view.setVerticalScrollMode(QAbstractItemView.ScrollPerPixel)
+        self.list_view.clicked.connect(self._on_item_clicked)
+        root.addWidget(self.list_view, 1)
+
+    # ------------------------------------------------------------------ API
+
+    def set_chats(self, rows: list[dict]) -> None:
+        """rows: [{'jid', 'name', 'preview', 'time', 'unread'}], уже отсортированные
+        так, как их нужно показать (сортировку по времени делает вызывающая сторона —
+        у неё есть полные данные chats, а не только эта проекция)."""
+        query = self.search_edit.text().strip().lower()
+        self._model.clear()
+        self._all_jids = [r["jid"] for r in rows]
+        for row in rows:
+            if query and query not in row["jid"].lower() and query not in row.get("name", "").lower():
+                continue
+            item = QStandardItem(row.get("name") or row["jid"])
+            item.setData(row["jid"], ROLE_JID)
+            item.setData(row.get("preview", ""), ROLE_PREVIEW)
+            item.setData(row.get("time", ""), ROLE_TIME)
+            item.setData(row.get("unread", 0), ROLE_UNREAD)
+            item.setEditable(False)
+            self._model.appendRow(item)
+
+    def select_jid(self, jid: str) -> None:
+        for row in range(self._model.rowCount()):
+            if self._model.item(row).data(ROLE_JID) == jid:
+                self.list_view.setCurrentIndex(self._model.index(row, 0))
+                return
+
+    # ------------------------------------------------------------------ внутреннее
+
+    def _on_item_clicked(self, index: QModelIndex) -> None:
+        jid = index.data(ROLE_JID)
+        if jid:
+            self.chat_selected.emit(jid)
+
+    def _on_search_changed(self, text: str) -> None:
+        self.search_text_changed.emit(text)
+
+
+# ======================================================================
+# 3. ПРАВАЯ ПАНЕЛЬ — ПЕРЕПИСКА (было ui/chat_view.py)
+# ======================================================================
+
+ROLE_MSG = Qt.UserRole + 1
+
+BUBBLE_MAX_WIDTH_RATIO = 0.65
+BUBBLE_PAD_V = 8
+BUBBLE_PAD_H = 12
+BUBBLE_RADIUS = 12
+GROUP_SPACING = 2       # между сообщениями одного отправителя подряд
+MSG_SPACING = 8         # между сообщениями разных отправителей
+TAIL_RESERVE = 46       # место под время + галочку в правом нижнем углу пузыря
+
+_STATUS_ICON = {
+    "sending": "\u23F3",      # ⏳
+    "delivered": "\u2713",    # ✓
+    "read": "\u2713\u2713",   # ✓✓
+    "failed": "\u2717",       # ✗
+}
+
+
+class MessageModel(QAbstractListModel):
+    """Список сообщений одного открытого диалога."""
+
+    def __init__(self, parent=None) -> None:
+        super().__init__(parent)
+        self._items: list[dict] = []
+
+    # ---- Qt.AbstractListModel API ----
+
+    def rowCount(self, parent: QModelIndex = QModelIndex()) -> int:
+        return 0 if parent.isValid() else len(self._items)
+
+    def data(self, index: QModelIndex, role: int = Qt.DisplayRole):
+        if not index.isValid() or not (0 <= index.row() < len(self._items)):
+            return None
+        if role in (Qt.DisplayRole, ROLE_MSG):
+            return self._items[index.row()]
+        return None
+
+    # ---- наш API ----
+
+    def set_messages(self, messages: list[dict]) -> None:
+        """Полная замена содержимого (вызывается при переключении чата)."""
+        self.beginResetModel()
+        self._items = list(messages)
+        self.endResetModel()
+
+    def append_message(self, msg: dict) -> None:
+        """Добавить одно сообщение в конец без пересборки всей модели."""
+        row = len(self._items)
+        self.beginInsertRows(QModelIndex(), row, row)
+        self._items.append(msg)
+        self.endInsertRows()
+
+    def update_message(self, msg_id: str, **changes) -> bool:
+        """Точечно обновить сообщение по msg_id (например, статус доставки)."""
+        for i, m in enumerate(self._items):
+            if m.get("msg_id") == msg_id:
+                m.update(changes)
+                idx = self.index(i, 0)
+                self.dataChanged.emit(idx, idx)
+                return True
+        return False
+
+    def message_at(self, row: int) -> dict | None:
+        return self._items[row] if 0 <= row < len(self._items) else None
+
+    def is_grouped_with_previous(self, row: int) -> bool:
+        """True, если сообщение row — продолжение группы того же отправителя (меньший отступ)."""
+        if row <= 0:
+            return False
+        return self._items[row]["type"] == self._items[row - 1]["type"]
+
+
+class MessageDelegate(QStyledItemDelegate):
+    """Рисует один пузырь сообщения через QTextLayout (без HTML)."""
+
+    def _bubble_font(self) -> QFont:
+        f = QFont()
+        f.setPointSize(9)
+        return f
+
+    def _meta_font(self) -> QFont:
+        f = QFont()
+        f.setPointSize(8)
+        return f
+
+    def _max_bubble_width(self, option: QStyleOptionViewItem) -> int:
+        return max(120, int(option.rect.width() * BUBBLE_MAX_WIDTH_RATIO))
+
+    def _layout_text(self, text: str, font: QFont, max_width: int) -> tuple[QTextLayout, float]:
+        """Раскладывает текст с переносом по словам, возвращает layout и высоту в px."""
+        layout = QTextLayout(text, font)
+        text_option = QTextOption()
+        text_option.setWrapMode(QTextOption.WrapAtWordBoundaryOrAnywhere)
+        layout.setTextOption(text_option)
+
+        layout.beginLayout()
+        height = 0.0
+        while True:
+            line = layout.createLine()
+            if not line.isValid():
+                break
+            line.setLineWidth(max_width)
+            line.setPosition(QRectF(0, height, max_width, 0).topLeft())
+            height += line.height()
+        layout.endLayout()
+        return layout, height
+
+    def sizeHint(self, option: QStyleOptionViewItem, index: QModelIndex) -> QSize:
+        msg = index.data(ROLE_MSG)
+        if not msg:
+            return QSize(option.rect.width(), 0)
+
+        grouped = index.model().is_grouped_with_previous(index.row())
+        max_w = self._max_bubble_width(option)
+        text_w = max_w - 2 * BUBBLE_PAD_H
+        _, text_h = self._layout_text(msg["message"], self._bubble_font(), text_w)
+
+        bubble_h = int(text_h) + 2 * BUBBLE_PAD_V + 14  # +14 под строку времени/галочки
+        top_margin = GROUP_SPACING if grouped else MSG_SPACING
+        return QSize(option.rect.width(), bubble_h + top_margin)
+
+    def paint(self, painter: QPainter, option: QStyleOptionViewItem, index: QModelIndex) -> None:
+
+        msg = index.data(ROLE_MSG)
+        if not msg:
+            return
+
+        painter.save()
+        painter.setRenderHint(QPainter.Antialiasing)
+
+        rect = option.rect
+        grouped = index.model().is_grouped_with_previous(index.row())
+        top_margin = GROUP_SPACING if grouped else MSG_SPACING
+
+        max_w = self._max_bubble_width(option)
+        text_w = max_w - 2 * BUBBLE_PAD_H
+        font = self._bubble_font()
+        layout, text_h = self._layout_text(msg["message"], font, text_w)
+
+        bubble_w = min(max_w, max(int(layout.maximumWidth()) + 2 * BUBBLE_PAD_H, 60))
+        bubble_h = int(text_h) + 2 * BUBBLE_PAD_V + 14
+
+        is_sent = msg["type"] == "sent"
+        if is_sent:
+            bx = rect.right() - bubble_w - 12
+            bubble_color = QColor(TELEGRAM_DARK["bubble_sent"])
+        else:
+            bx = rect.left() + 12
+            bubble_color = QColor(TELEGRAM_DARK["bubble_recv"])
+        by = rect.top() + top_margin
+
+        path = QPainterPath()
+        path.addRoundedRect(bx, by, bubble_w, bubble_h, BUBBLE_RADIUS, BUBBLE_RADIUS)
+        painter.fillPath(path, bubble_color)
+
+        # --- текст сообщения ---
+        painter.setPen(QColor(TELEGRAM_DARK["text_primary"]))
+        painter.setFont(font)
+        layout.draw(painter, QPointF(bx + BUBBLE_PAD_H, by + BUBBLE_PAD_V))
+
+        # --- время (+ статус для исходящих) ---
+        meta_font = self._meta_font()
+        painter.setFont(meta_font)
+        fm = QFontMetrics(meta_font)
+        time_text = msg.get("time", "")
+
+        if is_sent:
+            status = msg.get("status", "sending")
+            icon = _STATUS_ICON.get(status, "")
+            icon_color = {
+                "read": TELEGRAM_DARK["accent"],
+                "delivered": TELEGRAM_DARK["text_secondary"],
+                "failed": TELEGRAM_DARK["error"],
+                "sending": TELEGRAM_DARK["text_secondary"],
+            }.get(status, TELEGRAM_DARK["text_secondary"])
+
+            meta_y = by + bubble_h - BUBBLE_PAD_V - fm.height() + fm.ascent()
+            icon_w = fm.horizontalAdvance(icon)
+            time_w = fm.horizontalAdvance(time_text)
+
+            painter.setPen(QColor(TELEGRAM_DARK["text_secondary"]))
+            painter.drawText(int(bx + bubble_w - BUBBLE_PAD_H - icon_w - time_w - 4), int(meta_y), time_text)
+            painter.setPen(QColor(icon_color))
+            painter.drawText(int(bx + bubble_w - BUBBLE_PAD_H - icon_w), int(meta_y), icon)
+        else:
+            meta_y = by + bubble_h - BUBBLE_PAD_V - fm.height() + fm.ascent()
+            painter.setPen(QColor(TELEGRAM_DARK["text_secondary"]))
+            painter.drawText(int(bx + bubble_w - BUBBLE_PAD_H - fm.horizontalAdvance(time_text)), int(meta_y), time_text)
+
+        painter.restore()
+
+
+class ChatViewWidget(QWidget):
+    """Правая панель: шапка чата + список сообщений + поле ввода.
+
+    Не отправляет сообщения сама — эмитит send_requested(text), а
+    MainWindow.send_chat_message() (защищённое имя, логика не меняется)
+    решает, что с этим текстом делать. Аналогично header_clicked/back_clicked
+    только сигнализируют наверх.
+    """
+
+    send_requested = pyqtSignal(str)
+    header_clicked = pyqtSignal()
+    back_clicked = pyqtSignal()
+    menu_action_requested = pyqtSignal(str)  # "delete_chat" и т.п.
+
+    def __init__(self, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self.setObjectName("ChatView")
+        self._current_jid: str | None = None
+
+        root = QVBoxLayout(self)
+        root.setContentsMargins(0, 0, 0, 0)
+        root.setSpacing(0)
+
+        # ---------- шапка ----------
+        header = QWidget(self)
+        header.setObjectName("ChatHeader")
+        header.setFixedHeight(56)
+        header_layout = QHBoxLayout(header)
+        header_layout.setContentsMargins(8, 6, 12, 6)
+        header_layout.setSpacing(10)
+
+        self.back_btn = QToolButton(header)
+        self.back_btn.setObjectName("ChatBackButton")
+        self.back_btn.setText("\u2190")  # ←
+        self.back_btn.setProperty("flat", "true")
+        self.back_btn.setVisible(False)  # показывается только в узком (мобильном) режиме
+        self.back_btn.clicked.connect(self.back_clicked.emit)
+
+        header_click_area = QWidget(header)
+        hca_layout = QHBoxLayout(header_click_area)
+        hca_layout.setContentsMargins(0, 0, 0, 0)
+        hca_layout.setSpacing(10)
+
+        self.avatar_label = QLabel(header_click_area)
+        self.avatar_label.setObjectName("ChatHeaderAvatar")
+        self.avatar_label.setFixedSize(40, 40)
+        self.avatar_label.setAlignment(Qt.AlignCenter)
+
+        name_box = QVBoxLayout()
+        name_box.setSpacing(0)
+        self.name_label = QLabel("Выберите диалог", header_click_area)
+        self.name_label.setObjectName("ChatHeaderName")
+        self.status_label = QLabel("", header_click_area)
+        self.status_label.setObjectName("ChatHeaderStatus")
+        name_box.addWidget(self.name_label)
+        name_box.addWidget(self.status_label)
+
+        hca_layout.addWidget(self.avatar_label)
+        hca_layout.addLayout(name_box)
+        hca_layout.addStretch(1)
+        header_click_area.mousePressEvent = lambda _e: self.header_clicked.emit()  # noqa: E731
+
+        self.call_btn = QToolButton(header)
+        self.call_btn.setObjectName("ChatCallButton")
+        self.call_btn.setText("\U0001F4DE")  # 📞 (заглушка — звонков в XMPP-клиенте нет)
+        self.call_btn.setProperty("flat", "true")
+        self.call_btn.setEnabled(False)
+        self.call_btn.setToolTip("Звонки не поддерживаются")
+
+        self.menu_btn = QToolButton(header)
+        self.menu_btn.setObjectName("ChatMenuButton")
+        self.menu_btn.setText("\u22EE")  # ⋮
+        self.menu_btn.setProperty("flat", "true")
+        self.menu_btn.clicked.connect(lambda: self.menu_action_requested.emit("open_menu"))
+
+        header_layout.addWidget(self.back_btn)
+        header_layout.addWidget(header_click_area, 1)
+        header_layout.addWidget(self.call_btn)
+        header_layout.addWidget(self.menu_btn)
+        root.addWidget(header)
+
+        # ---------- список сообщений ----------
+        self.model = MessageModel(self)
+        self.message_list = QListView(self)
+        self.message_list.setObjectName("MessageListView")
+        self.message_list.setModel(self.model)
+        self.message_list.setItemDelegate(MessageDelegate(self.message_list))
+        self.message_list.setVerticalScrollMode(QListView.ScrollPerPixel)
+        self.message_list.setSelectionMode(QListView.NoSelection)
+        self.message_list.setEditTriggers(QListView.NoEditTriggers)
+        self.message_list.setResizeMode(QListView.Adjust)
+        root.addWidget(self.message_list, 1)
+
+        # ---------- поле ввода ----------
+        input_bar = QWidget(self)
+        input_bar.setObjectName("InputBar")
+        input_layout = QHBoxLayout(input_bar)
+        input_layout.setContentsMargins(10, 8, 10, 8)
+        input_layout.setSpacing(8)
+
+        self.attach_btn = QToolButton(input_bar)
+        self.attach_btn.setObjectName("InputAttachButton")
+        self.attach_btn.setText("\U0001F4CE")  # 📎 (заглушка — вложений в протоколе нет)
+        self.attach_btn.setProperty("flat", "true")
+        self.attach_btn.setEnabled(False)
+        self.attach_btn.setToolTip("Вложения не поддерживаются")
+
+        self.message_input = QTextEdit(input_bar)
+        self.message_input.setObjectName("MessageInput")
+        self.message_input.setPlaceholderText("Сообщение...")
+        self.message_input.setFixedHeight(36)
+        self.message_input.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+        self.message_input.document().documentLayout().documentSizeChanged.connect(self._resize_input)
+        self.message_input.installEventFilter(self)
+
+        self.emoji_btn = QToolButton(input_bar)
+        self.emoji_btn.setObjectName("InputEmojiButton")
+        self.emoji_btn.setText("\U0001F60A")  # 😊 (заглушка — без пикера эмодзи)
+        self.emoji_btn.setProperty("flat", "true")
+        self.emoji_btn.setEnabled(False)
+        self.emoji_btn.setToolTip("Выбор эмодзи не реализован")
+
+        self.send_btn = QPushButton("\u27A4", input_bar)  # ➤
+        self.send_btn.setObjectName("SendButton")
+        self.send_btn.setFixedSize(36, 36)
+        self.send_btn.setEnabled(False)
+        self.send_btn.clicked.connect(self._emit_send)
+
+        input_layout.addWidget(self.attach_btn)
+        input_layout.addWidget(self.message_input, 1)
+        input_layout.addWidget(self.emoji_btn)
+        input_layout.addWidget(self.send_btn)
+        root.addWidget(input_bar)
+
+        self.set_enabled_for_chat(False)
+
+    # ------------------------------------------------------------------ API для MainWindow
+
+    def set_header(self, jid: str, status_text: str = "") -> None:
+        self._current_jid = jid
+        self.name_label.setText(jid)
+        self.status_label.setText(status_text)
+
+        pix_size = self.avatar_label.width()
+        color = avatar_color(jid)
+        # Рисуем кружок-аватар прямо в QLabel через QPixmap, чтобы не заводить
+        # отдельный виджет ради одной круглой заглушки.
+        from PyQt5.QtGui import QPixmap
+        pm = QPixmap(pix_size, pix_size)
+        pm.fill(Qt.transparent)
+        p = QPainter(pm)
+        p.setRenderHint(QPainter.Antialiasing)
+        path = QPainterPath()
+        path.addEllipse(0, 0, pix_size, pix_size)
+        p.fillPath(path, color)
+        p.setPen(QColor("#ffffff"))
+        f = QFont(p.font())
+        f.setBold(True)
+        f.setPointSize(11)
+        p.setFont(f)
+        p.drawText(pm.rect(), Qt.AlignCenter, initials(jid))
+        p.end()
+        self.avatar_label.setPixmap(pm)
+
+    def clear_header(self) -> None:
+        self._current_jid = None
+        self.name_label.setText("Выберите диалог")
+        self.status_label.setText("")
+        self.avatar_label.clear()
+
+    def set_messages(self, messages: list[dict]) -> None:
+        self.model.set_messages(messages)
+        self.scroll_to_bottom()
+
+    def append_message(self, msg: dict) -> None:
+        self.model.append_message(msg)
+        self.scroll_to_bottom()
+
+    def update_message_status_visual(self, msg_id: str, **changes) -> None:
+        self.model.update_message(msg_id, **changes)
+
+    def scroll_to_bottom(self) -> None:
+        QTimer.singleShot(0, lambda: self.message_list.scrollToBottom())
+
+    def set_enabled_for_chat(self, enabled: bool) -> None:
+        self.send_btn.setEnabled(enabled)
+        self.message_input.setEnabled(enabled)
+
+    def current_jid(self) -> str | None:
+        return self._current_jid
+
+    def clear_input(self) -> None:
+        self.message_input.clear()
+
+    def focus_input(self) -> None:
+        self.message_input.setFocus()
+
+    # ------------------------------------------------------------------ внутреннее
+
+    def _resize_input(self) -> None:
+        doc_h = self.message_input.document().size().height()
+        new_h = max(36, min(120, int(doc_h) + 12))
+        self.message_input.setFixedHeight(new_h)
+
+    def _emit_send(self) -> None:
+        text = self.message_input.toPlainText().strip()
+        if text:
+            self.send_requested.emit(text)
+
+    def eventFilter(self, obj, event):  # noqa: N802 (имя метода задано Qt)
+        if obj is self.message_input and event.type() == event.KeyPress:
+            if event.key() in (Qt.Key_Return, Qt.Key_Enter) and not (event.modifiers() & Qt.ShiftModifier):
+                self._emit_send()
+                return True
+        return super().eventFilter(obj, event)
+
+
+# ======================================================================
+# 4. ПАНЕЛЬ ПРОФИЛЯ КОНТАКТА (было ui/profile_panel.py)
+# ======================================================================
+
+class ProfilePanel(QWidget):
+    """Скрыта по умолчанию (width=0). show_for(jid) выезжает слева направо."""
+
+    delete_chat_requested = pyqtSignal()
+    closed = pyqtSignal()
+
+    PANEL_WIDTH = 320
+
+    def __init__(self, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self.setObjectName("ProfilePanel")
+        self.setFixedWidth(0)  # свёрнута; анимация раскрывает до PANEL_WIDTH
+
+        root = QVBoxLayout(self)
+        root.setContentsMargins(0, 0, 0, 0)
+        root.setSpacing(0)
+
+        close_row = QPushButton("\u2715  Закрыть", self)  # ✕
+        close_row.setProperty("flat", "true")
+        close_row.setStyleSheet("text-align: left; padding: 12px 16px;")
+        close_row.clicked.connect(self.hide_panel)
+        root.addWidget(close_row)
+
+        self.avatar_label = QLabel(self)
+        self.avatar_label.setObjectName("ProfileAvatar")
+        self.avatar_label.setFixedSize(96, 96)
+        self.avatar_label.setAlignment(Qt.AlignCenter)
+        avatar_row = QVBoxLayout()
+        avatar_row.setAlignment(Qt.AlignHCenter)
+        avatar_row.addWidget(self.avatar_label, 0, Qt.AlignHCenter)
+        root.addLayout(avatar_row)
+
+        self.jid_label = QLabel("", self)
+        self.jid_label.setObjectName("ProfileJid")
+        self.jid_label.setAlignment(Qt.AlignCenter)
+        root.addWidget(self.jid_label)
+
+        self.status_label = QLabel("", self)
+        self.status_label.setObjectName("ProfileStatus")
+        self.status_label.setAlignment(Qt.AlignCenter)
+        root.addWidget(self.status_label)
+
+        root.addSpacing(16)
+
+        self.info_list = QListWidget(self)
+        self.info_list.setFrameShape(QListWidget.NoFrame)
+        for text in ("\U0001F514 Уведомления — скоро", "\U0001F5BC Медиа — скоро", "\U0001F517 Ссылки — скоро"):
+            item = QListWidgetItem(text)
+            item.setFlags(Qt.NoItemFlags)  # не кликабельно: честно "скоро", а не имитация
+            self.info_list.addItem(item)
+        root.addWidget(self.info_list, 1)
+
+        self.delete_btn = QPushButton("\U0001F5D1\uFE0F  Удалить диалог", self)  # 🗑️
+        self.delete_btn.setObjectName("ProfileDeleteButton")
+        self.delete_btn.clicked.connect(self.delete_chat_requested.emit)
+        root.addWidget(self.delete_btn)
+
+        self._anim = QPropertyAnimation(self, b"minimumWidth", self)
+        self._anim.setDuration(180)
+        self._anim.setEasingCurve(QEasingCurve.OutCubic)
+        self._anim2 = QPropertyAnimation(self, b"maximumWidth", self)
+        self._anim2.setDuration(180)
+        self._anim2.setEasingCurve(QEasingCurve.OutCubic)
+
+    def show_for(self, jid: str, status_text: str = "") -> None:
+
+        self.jid_label.setText(jid)
+        self.status_label.setText(status_text)
+
+        size = self.avatar_label.width()
+        pm = QPixmap(size, size)
+        pm.fill(Qt.transparent)
+        p = QPainter(pm)
+        p.setRenderHint(QPainter.Antialiasing)
+        path = QPainterPath()
+        path.addEllipse(0, 0, size, size)
+        p.fillPath(path, avatar_color(jid))
+        p.setPen(QColor("#ffffff"))
+        f = QFont(p.font())
+        f.setBold(True)
+        f.setPointSize(24)
+        p.setFont(f)
+        p.drawText(pm.rect(), Qt.AlignCenter, initials(jid))
+        p.end()
+        self.avatar_label.setPixmap(pm)
+
+        self._animate_to(self.PANEL_WIDTH)
+
+    def hide_panel(self) -> None:
+        self._animate_to(0)
+        self.closed.emit()
+
+    def _animate_to(self, width: int) -> None:
+        for anim in (self._anim, self._anim2):
+            anim.stop()
+            anim.setStartValue(self.width())
+            anim.setEndValue(width)
+        self._anim.start()
+        self._anim2.start()
+
+
+# ======================================================================
+# 5. ДИАЛОГ НАСТРОЕК (было ui/dialogs/settings.py)
+# ======================================================================
+
+SECTIONS = ["Соединение", "REST API", "Уведомления", "Внешний вид"]
+
+
+class SettingsDialog(QDialog):
+    def __init__(self, config: dict, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self.setObjectName("SettingsDialog")
+        self.setWindowTitle("Настройки")
+        self.resize(720, 520)
+        self._config = config
+
+        root = QVBoxLayout(self)
+        root.setContentsMargins(0, 0, 0, 0)
+        root.setSpacing(0)
+
+        body = QHBoxLayout()
+        body.setContentsMargins(0, 0, 0, 0)
+        body.setSpacing(0)
+
+        self.nav = QListWidget(self)
+        self.nav.setObjectName("SettingsNav")
+        self.nav.setFixedWidth(180)
+        for name in SECTIONS:
+            QListWidgetItem(name, self.nav)
+        self.nav.currentRowChanged.connect(self._on_nav_changed)
+
+        self.stack = QStackedWidget(self)
+        self.stack.setObjectName("SettingsStack")
+
+        self.stack.addWidget(self._build_connection_page())
+        self.stack.addWidget(self._build_rest_page())
+        self.stack.addWidget(self._build_notifications_page())
+        self.stack.addWidget(self._build_appearance_page())
+
+        body.addWidget(self.nav)
+        body.addWidget(self.stack, 1)
+        root.addLayout(body, 1)
+
+        buttons = QDialogButtonBox(QDialogButtonBox.Cancel | QDialogButtonBox.Save, self)
+        buttons.button(QDialogButtonBox.Save).setProperty("class", "primary")
+        buttons.button(QDialogButtonBox.Cancel).setProperty("class", "secondary")
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        root.addWidget(buttons)
+
+        self.nav.setCurrentRow(0)
+
+    # ------------------------------------------------------------------ страницы
+
+    def _scrollable(self, inner: QWidget) -> QScrollArea:
+        area = QScrollArea(self)
+        area.setWidgetResizable(True)
+        area.setFrameShape(QScrollArea.NoFrame)
+        area.setWidget(inner)
+        return area
+
+    def _build_connection_page(self) -> QWidget:
+        page = QWidget(self)
+        layout = QFormLayout(page)
+
+        xmpp = self._config.get("xmpp", {})
+        self.xmpp_server = QLineEdit(xmpp.get("server", ""))
+        self.xmpp_port = QSpinBox()
+        self.xmpp_port.setRange(1, 65535)
+        self.xmpp_port.setValue(xmpp.get("port", 5222))
+        self.xmpp_username = QLineEdit(xmpp.get("username", ""))
+        self.xmpp_password = QLineEdit(xmpp.get("password", ""))
+        self.xmpp_password.setEchoMode(QLineEdit.Password)
+        self.verify_tls = QCheckBox("Проверять TLS-сертификат")
+        self.verify_tls.setChecked(xmpp.get("verify_tls", False))
+
+        layout.addRow("\U0001F310 Сервер:", self.xmpp_server)
+        layout.addRow("\U0001F50C Порт:", self.xmpp_port)
+        layout.addRow("\U0001F464 Логин:", self.xmpp_username)
+        layout.addRow("\U0001F511 Пароль:", self.xmpp_password)
+        layout.addRow(self.verify_tls)
+
+        return self._scrollable(page)
+
+    def _build_rest_page(self) -> QWidget:
+        page = QWidget(self)
+        layout = QFormLayout(page)
+
+        rest = self._config.get("rest_api", {})
+        self.rest_host = QLineEdit(rest.get("host", ""))
+        self.rest_port = QSpinBox()
+        self.rest_port.setRange(1, 65535)
+        self.rest_port.setValue(rest.get("port", 8080))
+        self.rest_endpoint = QLineEdit(rest.get("endpoint", ""))
+        self.rest_api_key = QLineEdit(rest.get("api_key", ""))
+        self.rest_api_key.setEchoMode(QLineEdit.Password)
+        self.rest_api_key.setPlaceholderText("Пусто = без авторизации (не рекомендуется для 0.0.0.0)")
+
+        layout.addRow("\U0001F3E0 Хост:", self.rest_host)
+        layout.addRow("\U0001F50C Порт:", self.rest_port)
+        layout.addRow("\U0001F4E1 Endpoint:", self.rest_endpoint)
+        layout.addRow("\U0001F510 API ключ:", self.rest_api_key)
+
+        return self._scrollable(page)
+
+    def _build_notifications_page(self) -> QWidget:
+        # В текущем проекте нет отдельных настроек уведомлений (звук/пуши) —
+        # честно показываем заглушку вместо несуществующих переключателей.
+        page = QWidget(self)
+        layout = QVBoxLayout(page)
+        note = QLabel(
+            "Настройки уведомлений пока не реализованы в десктоп-клиенте.\n"
+            "Приоритет и звук уведомлений на Android-клиенте настраиваются отдельно.",
+            page,
+        )
+        note.setWordWrap(True)
+        note.setAlignment(Qt.AlignTop)
+        layout.addWidget(note)
+        layout.addStretch(1)
+        return self._scrollable(page)
+
+    def _build_appearance_page(self) -> QWidget:
+        # Тема сейчас одна (Telegram Dark), переключателя тем нет — тоже честная заглушка.
+        page = QWidget(self)
+        layout = QVBoxLayout(page)
+        note = QLabel("Сейчас доступна только тёмная тема (Telegram Dark).", page)
+        note.setWordWrap(True)
+        note.setAlignment(Qt.AlignTop)
+        layout.addWidget(note)
+        layout.addStretch(1)
+        return self._scrollable(page)
+
+    def _on_nav_changed(self, row: int) -> None:
+        if row >= 0:
+            self.stack.setCurrentIndex(row)
+
+    # ------------------------------------------------------------------ API для MainWindow
+
+    def get_values(self) -> dict:
+        """Возвращает значения полей в форме, готовой для merge в self.config."""
+        return {
+            "xmpp": {
+                "server": self.xmpp_server.text(),
+                "port": self.xmpp_port.value(),
+                "username": self.xmpp_username.text(),
+                "password": self.xmpp_password.text(),
+                "verify_tls": self.verify_tls.isChecked(),
+            },
+            "rest_api": {
+                "host": self.rest_host.text(),
+                "port": self.rest_port.value(),
+                "endpoint": self.rest_endpoint.text(),
+                "api_key": self.rest_api_key.text().strip(),
+            },
+        }
+
+
+# ======================================================================
+# 6. ДИАЛОГ ИСТОРИИ СООБЩЕНИЙ (было ui/dialogs/history.py)
+# ======================================================================
+
+class HistoryDialog(QDialog):
+    def __init__(self, logger, db_path: str = "logs/messages.db", parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self.setObjectName("HistoryDialog")
+        self.setWindowTitle("История сообщений")
+        self.resize(900, 560)
+        self.logger = logger
+        self.db_path = db_path
+
+        root = QVBoxLayout(self)
+
+        top = QHBoxLayout()
+        top.addWidget(QLabel("Фильтр:", self))
+        self.contact_combo = QComboBox(self)
+        self.contact_combo.setMinimumWidth(250)
+        self.contact_combo.addItem("Все диалоги")
+        self.contact_combo.currentTextChanged.connect(self.reload)
+        top.addWidget(self.contact_combo)
+        top.addStretch(1)
+
+        self.refresh_btn = QToolButton(self)
+        self.refresh_btn.setText("\U0001F504")  # 🔄
+        self.refresh_btn.setToolTip("Обновить")
+        self.refresh_btn.clicked.connect(self.reload)
+        top.addWidget(self.refresh_btn)
+
+        self.clean_btn = QToolButton(self)
+        self.clean_btn.setText("\U0001F5D1\uFE0F")  # 🗑️
+        self.clean_btn.setToolTip("Очистить старые логи (>14 дней)")
+        self.clean_btn.clicked.connect(self._clean_logs)
+        top.addWidget(self.clean_btn)
+
+        root.addLayout(top)
+
+        self.table = QTableWidget(self)
+        self.table.setColumnCount(6)
+        self.table.setHorizontalHeaderLabels(
+            ["Тип", "Отправитель", "Получатель", "Сообщение", "Время отправки", "Время доставки"]
+        )
+        self.table.setAlternatingRowColors(True)
+        self.table.setSelectionBehavior(QTableWidget.SelectRows)
+        self.table.setSelectionMode(QTableWidget.SingleSelection)
+        self.table.setEditTriggers(QTableWidget.NoEditTriggers)
+        self.table.setShowGrid(False)
+        self.table.verticalHeader().setVisible(False)
+        self.table.verticalHeader().setDefaultSectionSize(38)
+
+        header = self.table.horizontalHeader()
+        header.setStretchLastSection(True)
+        header.setSectionResizeMode(0, QHeaderView.ResizeToContents)
+        header.setSectionResizeMode(1, QHeaderView.ResizeToContents)
+        header.setSectionResizeMode(2, QHeaderView.ResizeToContents)
+        header.setSectionResizeMode(3, QHeaderView.Stretch)
+        header.setSectionResizeMode(4, QHeaderView.ResizeToContents)
+        header.setSectionResizeMode(5, QHeaderView.ResizeToContents)
+
+        self.table.setContextMenuPolicy(Qt.CustomContextMenu)
+        self.table.customContextMenuRequested.connect(self._show_context_menu)
+
+        root.addWidget(self.table, 1)
+
+        self.status_label = QLabel("Готов", self)
+        root.addWidget(self.status_label)
+
+        close_btn = QPushButton("Закрыть", self)
+        close_btn.setProperty("class", "secondary")
+        close_btn.clicked.connect(self.close)
+        root.addWidget(close_btn, 0, Qt.AlignRight)
+
+        self.refresh_contacts(current_user="")
+        self.reload()
+
+    # ------------------------------------------------------------------ API для MainWindow
+
+    def refresh_contacts(self, current_user: str) -> None:
+        """Пересобрать список контактов в комбобоксе (была update_contacts_list)."""
+        if not os.path.exists(self.db_path):
+            return
+        try:
+            conn = sqlite3.connect(self.db_path)
+            cursor = conn.cursor()
+            cursor.execute(
+                """
+                SELECT DISTINCT
+                    CASE
+                        WHEN sender = ? THEN recipient
+                        WHEN recipient = ? THEN sender
+                    END as contact
+                FROM messages
+                WHERE sender = ? OR recipient = ?
+                """,
+                (current_user, current_user, current_user, current_user),
+            )
+            contacts = set()
+            for row in cursor.fetchall():
+                contact = row[0]
+                if contact and contact != current_user:
+                    contact = contact.split("/")[0]
+                    contacts.add(contact)
+            conn.close()
+        except Exception:
+            return
+
+        current = self.contact_combo.currentText()
+        self.contact_combo.blockSignals(True)
+        self.contact_combo.clear()
+        self.contact_combo.addItem("Все диалоги")
+        for contact in sorted(contacts):
+            self.contact_combo.addItem(contact)
+        idx = self.contact_combo.findText(current)
+        self.contact_combo.setCurrentIndex(idx if idx >= 0 else 0)
+        self.contact_combo.blockSignals(False)
+
+    def reload(self) -> None:
+        try:
+            selected = self.contact_combo.currentText()
+            self.table.setRowCount(0)
+            self.status_label.setText("Загрузка...")
+
+            if not os.path.exists(self.db_path):
+                self.status_label.setText("\u274C База данных не найдена")
+                return
+
+            conn = sqlite3.connect(self.db_path)
+            cursor = conn.cursor()
+            if selected == "Все диалоги" or not selected:
+                cursor.execute(
+                    """
+                    SELECT type, sender, recipient, message, send_time, delivery_time, log_time
+                    FROM messages ORDER BY id DESC LIMIT 500
+                    """
+                )
+            else:
+                clean_contact = selected.split("/")[0]
+                cursor.execute(
+                    """
+                    SELECT type, sender, recipient, message, send_time, delivery_time, log_time
+                    FROM messages WHERE sender LIKE ? OR recipient LIKE ?
+                    ORDER BY id DESC LIMIT 500
+                    """,
+                    (f"%{clean_contact}%", f"%{clean_contact}%"),
+                )
+            rows = cursor.fetchall()
+            conn.close()
+
+            self.table.setRowCount(len(rows))
+            for i, row in enumerate(rows):
+                msg_type, sender, recipient, message, send_time, delivery_time = row[0], row[1], row[2], row[3], row[4], row[5]
+                message = message[:150] + "..." if len(message) > 150 else message
+                send_time = send_time[:16] if send_time else "-"
+                delivery_time = delivery_time[:16] if delivery_time else "-"
+
+                type_color = "#43b581" if msg_type == "SENT" else "#5288c1"
+                type_icon = "\U0001F4E4" if msg_type == "SENT" else "\U0001F4E5"
+
+                type_item = QTableWidgetItem(f"{type_icon} {msg_type}")
+                type_item.setForeground(QColor(type_color))
+
+                self.table.setItem(i, 0, type_item)
+                self.table.setItem(i, 1, QTableWidgetItem(sender.split("/")[0] if sender else "-"))
+                self.table.setItem(i, 2, QTableWidgetItem(recipient.split("/")[0] if recipient else "-"))
+                self.table.setItem(i, 3, QTableWidgetItem(message))
+                self.table.setItem(i, 4, QTableWidgetItem(send_time))
+                self.table.setItem(i, 5, QTableWidgetItem(delivery_time))
+
+            self.status_label.setText(f"\U0001F4CA Загружено {len(rows)} сообщений")
+        except Exception as exc:
+            self.status_label.setText(f"\u274C Ошибка: {exc}")
+
+    # ------------------------------------------------------------------ внутреннее
+
+    def _show_context_menu(self, position) -> None:
+        menu = QMenu(self)
+        copy_action = menu.addAction("\U0001F4CB Копировать текст сообщения")
+        copy_action.triggered.connect(self._copy_selected)
+        menu.exec_(self.table.viewport().mapToGlobal(position))
+
+    def _copy_selected(self) -> None:
+        row = self.table.currentRow()
+        if row < 0:
+            return
+        item = self.table.item(row, 3)
+        if item:
+            from PyQt5.QtWidgets import QApplication
+            QApplication.clipboard().setText(item.text())
+            self.status_label.setText("\u2705 Скопировано")
+            QTimer.singleShot(2000, lambda: self.status_label.setText("Готов"))
+
+    def _clean_logs(self) -> None:
+        reply = QMessageBox.question(
+            self, "Очистка логов",
+            "Удалить все сообщения старше 14 дней?\nЭто действие нельзя отменить.",
+            QMessageBox.Yes | QMessageBox.No,
+        )
+        if reply == QMessageBox.Yes:
+            try:
+                self.logger.clean_old_logs(14)
+                self.reload()
+                QMessageBox.information(self, "Успех", "Старые логи удалены")
+            except Exception as exc:
+                QMessageBox.critical(self, "Ошибка", f"Ошибка очистки: {exc}")
+
+
+# ======================================================================
+# 7. ДИАЛОГ ЛОГОВ (было ui/dialogs/logs.py)
+# ======================================================================
+
+class LogsDialog(QDialog):
+    def __init__(self, export_callback, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self.setObjectName("LogsDialog")
+        self.setWindowTitle("Логи")
+        self.resize(800, 500)
+        self._export_callback = export_callback
+
+        root = QVBoxLayout(self)
+
+        filter_row = QHBoxLayout()
+        filter_row.addWidget(QLabel("\U0001F50D Фильтр:", self))
+        self.filter_combo = QComboBox(self)
+        self.filter_combo.addItems(["Все", "Отправленные", "Полученные", "Ошибки"])
+        filter_row.addWidget(self.filter_combo)
+        filter_row.addStretch(1)
+        root.addLayout(filter_row)
+
+        self.log_view = QTextEdit(self)
+        self.log_view.setObjectName("LogsView")
+        self.log_view.setReadOnly(True)
+        self.log_view.setFont(QFont("Consolas", 9))
+        root.addWidget(self.log_view, 1)
+
+        btn_row = QHBoxLayout()
+        export_btn = QPushButton("\U0001F4C1 Экспорт JSON", self)
+        export_btn.clicked.connect(self._export)
+        clear_btn = QPushButton("\U0001F5D1\uFE0F Очистить", self)
+        clear_btn.clicked.connect(self.log_view.clear)
+        btn_row.addWidget(export_btn)
+        btn_row.addWidget(clear_btn)
+        btn_row.addStretch(1)
+        close_btn = QPushButton("Закрыть", self)
+        close_btn.setProperty("class", "secondary")
+        close_btn.clicked.connect(self.close)
+        btn_row.addWidget(close_btn)
+        root.addLayout(btn_row)
+
+    # ------------------------------------------------------------------ API для MainWindow
+
+    def load_entries(self, html_entries: list[str]) -> None:
+        self.log_view.clear()
+        for entry in html_entries:
+            self.log_view.append(entry)
+        self._scroll_to_bottom()
+
+    def append_entry(self, html_entry: str) -> None:
+        self.log_view.append(html_entry)
+        self._scroll_to_bottom()
+
+    def _scroll_to_bottom(self) -> None:
+        scrollbar = self.log_view.verticalScrollBar()
+        scrollbar.setValue(scrollbar.maximum())
+
+    def _export(self) -> None:
+        from PyQt5.QtWidgets import QMessageBox
+        try:
+            filepath = self._export_callback()
+            QMessageBox.information(self, "Успех", f"Логи экспортированы в:\n{filepath}")
+        except Exception as exc:
+            QMessageBox.critical(self, "Ошибка", f"Ошибка экспорта: {exc}")
+
+
+# ======================================================================
+# 8. ГЛАВНОЕ ОКНО XMPPGUI (было main_window.py)
+# ======================================================================
+
+os.environ['LANG'] = 'ru_RU.UTF-8'
+
+
 class XMPPGUI(QMainWindow):
-    # --- Межпоточные сигналы (объявлены на уровне класса) ---
+    # --- Межпоточные сигналы (объявлены на уровне класса) --- НЕ ТРОГАТЬ
     sig_received_message = pyqtSignal(str, str, str)   # from_jid, message, msg_id
     sig_delivery_received = pyqtSignal(str)            # msg_id
     sig_receipt_received = pyqtSignal(str)             # msg_id
@@ -45,6 +1702,14 @@ class XMPPGUI(QMainWindow):
         self.pending_messages_lock = Lock()
         self._chat_dirty = False
         self._history_dirty = False
+
+        # Буфер логов для LogsDialog (диалог не живёт постоянно — см. docstring, п.3)
+        self._log_entries: list[str] = []
+
+        # Диалоги открываются по требованию, ссылки держим, чтобы не плодить
+        # копии и чтобы можно было форвардить обновления (reload) в открытый.
+        self.history_dialog: HistoryDialog | None = None
+        self.logs_dialog: LogsDialog | None = None
 
         # --- Подключение сигналов к слотам (выполняются в главном потоке) ---
         self.sig_received_message.connect(self._process_received_message)
@@ -106,77 +1771,54 @@ class XMPPGUI(QMainWindow):
         with open(history_file, 'w', encoding='utf-8') as f:
             json.dump(data, f, ensure_ascii=False, indent=2)
 
+    # ================================================================== UI
+
     def init_ui(self):
+        self.setObjectName("MainWindow")
         self.setWindowTitle("XMPP Мессенджер")
-        self.setGeometry(100, 100, 1300, 800)
+        self.setGeometry(100, 100, 1100, 720)
 
         font = QFont("Segoe UI", 9)
         self.setFont(font)
+        self.setStyleSheet(build_qss())
 
-        self.setStyleSheet("""
-            QMainWindow { background-color: #36393f; }
-            QLabel { color: #dcddde; }
-            QGroupBox { color: #dcddde; border: none; margin-top: 8px; padding-top: 8px; font-weight: bold; }
-            QGroupBox::title { subcontrol-origin: margin; left: 10px; padding: 0 5px; color: #8e9297; }
-            QLineEdit, QTextEdit { background-color: #40444b; color: #dcddde; border: none; border-radius: 4px; padding: 6px; font-size: 9pt; }
-            QLineEdit:focus, QTextEdit:focus { border: 1px solid #7289da; }
-            QListWidget { background-color: #2f3136; color: #dcddde; border: none; outline: none; }
-            QListWidget::item { padding: 8px 12px; border: none; }
-            QListWidget::item:selected { background-color: #40444b; }
-            QListWidget::item:hover { background-color: #393c41; }
-            QPushButton { background-color: #7289da; color: white; border: none; padding: 6px 12px; border-radius: 4px; font-weight: bold; font-size: 9pt; }
-            QPushButton:hover { background-color: #677bc4; }
-            QPushButton:pressed { background-color: #5b6eae; }
-            QPushButton:disabled { background-color: #4f545c; }
-            QTabWidget::pane { background-color: #36393f; border: none; }
-            QTabBar::tab { background-color: #2f3136; color: #8e9297; padding: 6px 16px; min-width: 100px; font-size: 10pt; border: none; }
-            QTabBar::tab:selected { background-color: #36393f; color: #ffffff; border-bottom: 2px solid #7289da; }
-            QTabBar::tab:hover { color: #dcddde; }
-            QStatusBar { background-color: #2f3136; color: #8e9297; }
-            QTextEdit#chat_display { background-color: #36393f; border: none; padding: 8px; }
-            QScrollBar:vertical { background-color: #2f3136; width: 8px; border-radius: 4px; }
-            QScrollBar::handle:vertical { background-color: #40444b; border-radius: 4px; min-height: 20px; }
-            QScrollBar::handle:vertical:hover { background-color: #4f545c; }
-            QMenu { background-color: #2f3136; color: #dcddde; border: 1px solid #40444b; }
-            QMenu::item:selected { background-color: #40444b; }
-            QDialog { background-color: #2f3136; }
-            QTableWidget { background-color: #2f3136; color: #dcddde; gridline-color: #40444b; selection-background-color: #40444b; }
-            QHeaderView::section { background-color: #202225; color: #8e9297; padding: 6px; border: none; }
-            QComboBox { background-color: #40444b; color: #dcddde; border: none; border-radius: 4px; padding: 4px 8px; }
-            QComboBox::drop-down { border: none; }
-            QComboBox QAbstractItemView { background-color: #2f3136; color: #dcddde; selection-background-color: #40444b; }
-        """)
+        splitter = QSplitter(Qt.Horizontal, self)
 
-        tabs = QTabWidget()
+        self.sidebar = SidebarWidget(splitter)
+        self.sidebar.chat_selected.connect(self._on_chat_selected)
+        self.sidebar.new_chat_requested.connect(self.add_new_chat)
+        self.sidebar.menu_requested.connect(self._show_hamburger_menu)
 
-        chat_tab = QWidget()
-        self.setup_chat_tab(chat_tab)
-        tabs.addTab(chat_tab, "💬 Чаты")
+        right_container = QWidget(splitter)
+        right_layout = QHBoxLayout(right_container)
+        right_layout.setContentsMargins(0, 0, 0, 0)
+        right_layout.setSpacing(0)
 
-        history_tab = QWidget()
-        self.setup_history_tab(history_tab)
-        tabs.addTab(history_tab, "📜 История")
+        self.chat_view = ChatViewWidget(right_container)
+        self.chat_view.send_requested.connect(self._on_send_requested)
+        self.chat_view.header_clicked.connect(self._toggle_profile_panel)
+        self.chat_view.menu_action_requested.connect(self._on_chat_menu_action)
 
-        logs_tab = QWidget()
-        self.setup_logs_tab(logs_tab)
-        tabs.addTab(logs_tab, "📋 Логи")
+        self.profile_panel = ProfilePanel(right_container)
+        self.profile_panel.delete_chat_requested.connect(self.delete_current_chat)
 
-        settings_tab = QWidget()
-        self.setup_settings_tab(settings_tab)
-        tabs.addTab(settings_tab, "⚙️ Настройки")
+        right_layout.addWidget(self.chat_view, 1)
+        right_layout.addWidget(self.profile_panel)
 
-        info_tab = QWidget()
-        self.setup_info_tab(info_tab)
-        tabs.addTab(info_tab, "ℹ️ О программе")
+        splitter.addWidget(self.sidebar)
+        splitter.addWidget(right_container)
+        splitter.setStretchFactor(0, 0)
+        splitter.setStretchFactor(1, 1)
+        splitter.setSizes([320, 780])
 
-        self.setCentralWidget(tabs)
+        self.setCentralWidget(splitter)
 
         self.statusBar = QStatusBar()
         self.setStatusBar(self.statusBar)
-        self.status_label = QLabel("🔴 Не подключено")
+        self.status_label = QLabel("\U0001F534 Не подключено")
         self.statusBar.addWidget(self.status_label)
 
-        # Таймер обновления чата — реже и только при изменениях
+        # Таймер обновления чата — реже и только при изменениях (поведение не менялось)
         self.update_timer = QTimer()
         self.update_timer.timeout.connect(self._tick_ui_update)
         self.update_timer.start(1000)
@@ -193,356 +1835,126 @@ class XMPPGUI(QMainWindow):
             self.refresh_chat_display()
         if self._history_dirty:
             self._history_dirty = False
-            self.load_history()
+            if self.history_dialog is not None and self.history_dialog.isVisible():
+                self.history_dialog.reload()
 
-    def setup_history_tab(self, tab):
-        layout = QVBoxLayout()
-        tab.setLayout(layout)
-        layout.setContentsMargins(0, 0, 0, 0)
-        layout.setSpacing(0)
+    # ------------------------------------------------------------ гамбургер-меню
 
-        top_panel = QFrame()
-        top_panel.setStyleSheet("background-color: #2f3136; border-bottom: 1px solid #202225;")
-        top_panel.setFixedHeight(50)
-        top_layout = QHBoxLayout()
-        top_panel.setLayout(top_layout)
-        top_layout.setContentsMargins(16, 8, 16, 8)
+    def _show_hamburger_menu(self) -> None:
+        menu = QMenu(self)
+        menu.addAction("\U0001F464 Мой профиль", self._show_my_profile)
+        menu.addAction("\u2699\uFE0F Настройки", self.open_settings_dialog)
+        menu.addAction("\U0001F4DC История", self.open_history_dialog)
+        menu.addAction("\U0001F4CB Логи", self.open_logs_dialog)
+        menu.addSeparator()
+        menu.addAction("\U0001F50C Подключиться", self.connect_xmpp)
+        menu.addAction("\U0001F464 Создать пользователя", self.open_register_dialog)
+        menu.addAction("\U0001F680 Запустить REST", self.start_rest)
+        menu.addSeparator()
+        menu.addAction("\u2139\uFE0F О программе", self._show_about)
+        menu.addAction("\U0001F6AA Выход", self.close)
+        menu.exec_(self.sidebar.menu_btn.mapToGlobal(self.sidebar.menu_btn.rect().bottomLeft()))
 
-        title_label = QLabel("📜 ИСТОРИЯ СООБЩЕНИЙ")
-        title_label.setStyleSheet("color: #ffffff; font-weight: bold; font-size: 12pt;")
-        top_layout.addWidget(title_label)
-        top_layout.addStretch()
+    def _show_my_profile(self) -> None:
+        username = self.config.get("xmpp", {}).get("username", "-")
+        server = self.config.get("xmpp", {}).get("server", "-")
+        QMessageBox.information(self, "Мой профиль", f"\U0001F464 {username}@{server}")
 
-        filter_label = QLabel("Фильтр:")
-        filter_label.setStyleSheet("color: #8e9297;")
-        top_layout.addWidget(filter_label)
+    def _show_about(self) -> None:
+        QMessageBox.about(
+            self, "О программе",
+            "<h2 style='color:#5288c1;'>\U0001F4E8 XMPP Мессенджер</h2>"
+            "<p><b>Версия:</b> 2.0</p>"
+            "<p><b>Протокол:</b> XMPP (Jabber)</p>"
+            "<p><b>API:</b> REST</p>"
+            "<ul>"
+            "<li>Статусы сообщений: \u2713 доставлено, \u2713\u2713 прочитано</li>"
+            "<li>REST API для внешних систем</li>"
+            "<li>История сообщений с фильтром по контактам</li>"
+            "<li>Автоочистка логов каждые 14 дней</li>"
+            "</ul>",
+        )
 
-        self.history_contact_combo = QComboBox()
-        self.history_contact_combo.setMinimumWidth(250)
-        self.history_contact_combo.setStyleSheet("""
-            QComboBox { background-color: #40444b; color: #dcddde; border: none; border-radius: 4px; padding: 5px 10px; }
-            QComboBox::drop-down { border: none; }
-            QComboBox QAbstractItemView { background-color: #2f3136; color: #dcddde; selection-background-color: #40444b; }
-        """)
-        self.history_contact_combo.addItem("Все диалоги")
-        self.history_contact_combo.currentTextChanged.connect(self.load_history)
-        top_layout.addWidget(self.history_contact_combo)
+    # ------------------------------------------------------------ диалоги по требованию
 
-        self.refresh_btn = QPushButton("🔄")
-        self.refresh_btn.setFixedSize(32, 32)
-        self.refresh_btn.setToolTip("Обновить")
-        self.refresh_btn.setStyleSheet("QPushButton { background-color: #40444b; border: none; border-radius: 4px; color: #dcddde; font-size: 14pt; } QPushButton:hover { background-color: #7289da; }")
-        self.refresh_btn.clicked.connect(self.load_history)
-        top_layout.addWidget(self.refresh_btn)
+    def open_settings_dialog(self) -> None:
+        dialog = SettingsDialog(self.config, self)
+        if dialog.exec_() == QDialog.Accepted:
+            values = dialog.get_values()
+            self.config["xmpp"].update(values["xmpp"])
+            self.config["rest_api"].update(values["rest_api"])
+            self.persist_settings()
+            self.log_callback("Настройки сохранены", "INFO")
 
-        self.clean_btn = QPushButton("🗑️")
-        self.clean_btn.setFixedSize(32, 32)
-        self.clean_btn.setToolTip("Очистить старые логи")
-        self.clean_btn.setStyleSheet("QPushButton { background-color: #40444b; border: none; border-radius: 4px; color: #dcddde; font-size: 12pt; } QPushButton:hover { background-color: #f04747; }")
-        self.clean_btn.clicked.connect(self.clean_logs_manual)
-        top_layout.addWidget(self.clean_btn)
+    def open_history_dialog(self) -> None:
+        if self.history_dialog is None:
+            self.history_dialog = HistoryDialog(self.logger, parent=self)
+        current_user = self.config.get("xmpp", {}).get("username", "")
+        self.history_dialog.refresh_contacts(current_user)
+        self.history_dialog.reload()
+        self.history_dialog.show()
+        self.history_dialog.raise_()
 
-        layout.addWidget(top_panel)
+    def open_logs_dialog(self) -> None:
+        if self.logs_dialog is None:
+            self.logs_dialog = LogsDialog(self.logger.export_to_json, parent=self)
+            self.logs_dialog.load_entries(self._log_entries)
+        self.logs_dialog.show()
+        self.logs_dialog.raise_()
 
-        self.history_table = QTableWidget()
-        self.history_table.setColumnCount(6)
-        self.history_table.setHorizontalHeaderLabels(["Тип", "Отправитель", "Получатель", "Сообщение", "Время отправки", "Время доставки"])
-        self.history_table.setAlternatingRowColors(True)
-        self.history_table.setSelectionBehavior(QTableWidget.SelectRows)
-        self.history_table.setSelectionMode(QTableWidget.SingleSelection)
-        self.history_table.setEditTriggers(QTableWidget.NoEditTriggers)
-        self.history_table.setWordWrap(True)
-        self.history_table.setShowGrid(False)
+    # ------------------------------------------------------------ список/чат
 
-        header = self.history_table.horizontalHeader()
-        header.setStretchLastSection(True)
-        header.setSectionResizeMode(0, QHeaderView.ResizeToContents)
-        header.setSectionResizeMode(1, QHeaderView.ResizeToContents)
-        header.setSectionResizeMode(2, QHeaderView.ResizeToContents)
-        header.setSectionResizeMode(3, QHeaderView.Stretch)
-        header.setSectionResizeMode(4, QHeaderView.ResizeToContents)
-        header.setSectionResizeMode(5, QHeaderView.ResizeToContents)
-        header.setDefaultAlignment(Qt.AlignLeft | Qt.AlignVCenter)
-        header.setStyleSheet("""
-            QHeaderView::section {
-                background-color: #2f3136;
-                color: #8e9297;
-                font-weight: bold;
-                font-size: 9pt;
-                padding: 12px 8px;
-                border: none;
-                border-bottom: 1px solid #202225;
-            }
-        """)
-
-        self.history_table.setStyleSheet("""
-            QTableWidget {
-                background-color: #36393f;
-                alternate-background-color: #2f3136;
-                color: #dcddde;
-                font-size: 9pt;
-                outline: none;
-                border: none;
-            }
-            QTableWidget::item {
-                padding: 10px 8px;
-                border-bottom: 1px solid #40444b;
-            }
-            QTableWidget::item:selected {
-                background-color: #40444b;
-            }
-        """)
-
-        self.history_table.verticalHeader().setDefaultSectionSize(45)
-        self.history_table.verticalHeader().setVisible(False)
-        self.history_table.setSortingEnabled(True)
-
-        layout.addWidget(self.history_table)
-
-        bottom_panel = QFrame()
-        bottom_panel.setStyleSheet("background-color: #2f3136; border-top: 1px solid #202225;")
-        bottom_panel.setFixedHeight(40)
-        bottom_layout = QHBoxLayout()
-        bottom_panel.setLayout(bottom_layout)
-        bottom_layout.setContentsMargins(16, 8, 16, 8)
-
-        self.history_status = QLabel("Готов")
-        self.history_status.setStyleSheet("color: #8e9297; font-size: 9pt;")
-        bottom_layout.addWidget(self.history_status)
-        bottom_layout.addStretch()
-
-        layout.addWidget(bottom_panel)
-
-        self.history_table.setContextMenuPolicy(Qt.CustomContextMenu)
-        self.history_table.customContextMenuRequested.connect(self.show_history_context_menu)
-
-        self.load_history()
-
-    def show_history_context_menu(self, position):
-        menu = QMenu()
-        copy_action = menu.addAction("📋 Копировать текст сообщения")
-        copy_action.triggered.connect(self.copy_selected_history)
-        menu.exec_(self.history_table.viewport().mapToGlobal(position))
-
-    def copy_selected_history(self):
-        row = self.history_table.currentRow()
-        if row >= 0:
-            message_item = self.history_table.item(row, 3)
-            if message_item:
-                QApplication.clipboard().setText(message_item.text())
-                self.history_status.setText("✅ Скопировано")
-                QTimer.singleShot(2000, lambda: self.history_status.setText("Готов"))
-
-    def load_history(self):
-        try:
-            selected = self.history_contact_combo.currentText()
-
-            self.history_table.setRowCount(0)
-            self.history_status.setText("Загрузка...")
-
-            db_path = "logs/messages.db"
-            if not os.path.exists(db_path):
-                self.history_status.setText("❌ База данных не найдена")
-                return
-
-            conn = sqlite3.connect(db_path)
-            cursor = conn.cursor()
-
-            if selected == "Все диалоги":
-                cursor.execute('''
-                    SELECT type, sender, recipient, message, send_time, delivery_time, log_time
-                    FROM messages 
-                    ORDER BY id DESC 
-                    LIMIT 500
-                ''')
+    def add_new_chat(self):
+        contact, ok = QInputDialog.getText(
+            self, "Новый чат", "Введите JID пользователя (например: username@arsenal):"
+        )
+        if ok and contact:
+            if contact not in self.chats:
+                self.chats[contact] = []
+                self.save_chat_history()
+                self.refresh_chats_list()
+                self.log_callback(f"Начат чат с {contact}", "INFO")
+                self._open_chat(contact)
             else:
-                clean_contact = selected.split('/')[0]
-                cursor.execute('''
-                    SELECT type, sender, recipient, message, send_time, delivery_time, log_time
-                    FROM messages 
-                    WHERE sender LIKE ? OR recipient LIKE ?
-                    ORDER BY id DESC 
-                    LIMIT 500
-                ''', (f'%{clean_contact}%', f'%{clean_contact}%'))
+                QMessageBox.warning(self, "Внимание", "Чат с этим пользователем уже существует")
 
-            rows = cursor.fetchall()
-            conn.close()
+    def _on_chat_selected(self, jid: str) -> None:
+        self._open_chat(jid)
 
-            self.history_table.setRowCount(len(rows))
+    def _open_chat(self, contact: str) -> None:
+        self.current_contact = contact
+        self.chat_view.set_header(contact)
+        self.chat_view.set_enabled_for_chat(True)
+        self.sidebar.select_jid(contact)
+        self.mark_messages_as_read(contact)
+        self.refresh_chat_display()
+        self.chat_view.focus_input()
 
-            for i, row in enumerate(rows):
-                msg_type = row[0]
-                sender = row[1]
-                recipient = row[2]
-                message = row[3][:150] + "..." if len(row[3]) > 150 else row[3]
-                send_time = row[4][:16] if row[4] else "-"
-                delivery_time = row[5][:16] if row[5] else "-"
+    def _toggle_profile_panel(self) -> None:
+        jid = self.chat_view.current_jid()
+        if not jid:
+            return
+        if self.profile_panel.width() > 0:
+            self.profile_panel.hide_panel()
+        else:
+            self.profile_panel.show_for(jid)
 
-                type_color = "#43b581" if msg_type == "SENT" else "#7289da"
-                type_icon = "📤" if msg_type == "SENT" else "📥"
-
-                type_item = QTableWidgetItem(f"{type_icon} {msg_type}")
-                type_item.setForeground(QColor(type_color))
-                sender_item = QTableWidgetItem(sender.split('/')[0] if sender else "-")
-                recipient_item = QTableWidgetItem(recipient.split('/')[0] if recipient else "-")
-                message_item = QTableWidgetItem(message)
-                send_time_item = QTableWidgetItem(send_time)
-                delivery_time_item = QTableWidgetItem(delivery_time)
-
-                self.history_table.setItem(i, 0, type_item)
-                self.history_table.setItem(i, 1, sender_item)
-                self.history_table.setItem(i, 2, recipient_item)
-                self.history_table.setItem(i, 3, message_item)
-                self.history_table.setItem(i, 4, send_time_item)
-                self.history_table.setItem(i, 5, delivery_time_item)
-
-            self.history_status.setText(f"📊 Загружено {len(rows)} сообщений")
-
-        except Exception as e:
-            self.history_status.setText(f"❌ Ошибка: {str(e)}")
-
-    def clean_logs_manual(self):
-        reply = QMessageBox.question(self, "Очистка логов",
-                                     "Удалить все сообщения старше 14 дней?\nЭто действие нельзя отменить.",
-                                     QMessageBox.Yes | QMessageBox.No)
-        if reply == QMessageBox.Yes:
-            try:
-                self.logger.clean_old_logs(14)
-                self.load_history()
-                self.log_callback("Логи старше 14 дней удалены", "INFO")
-                QMessageBox.information(self, "Успех", "Старые логи удалены")
-            except Exception as e:
-                QMessageBox.critical(self, "Ошибка", f"Ошибка очистки: {str(e)}")
-
-    def update_contacts_list(self):
-        try:
-            current_user = self.xmpp_username.text() if hasattr(self, 'xmpp_username') and self.xmpp_username else ""
-
-            conn = sqlite3.connect('logs/messages.db')
-            cursor = conn.cursor()
-
-            cursor.execute('''
-                SELECT DISTINCT 
-                    CASE 
-                        WHEN sender = ? THEN recipient
-                        WHEN recipient = ? THEN sender
-                    END as contact
-                FROM messages 
-                WHERE sender = ? OR recipient = ?
-            ''', (current_user, current_user, current_user, current_user))
-
-            contacts = set()
-            for row in cursor.fetchall():
-                contact = row[0]
-                if contact and contact != current_user:
-                    if '/' in contact:
-                        contact = contact.split('/')[0]
-                    contacts.add(contact)
-            conn.close()
-
-            current = self.history_contact_combo.currentText()
-
-            self.history_contact_combo.clear()
-            self.history_contact_combo.addItem("Все диалоги")
-            for contact in sorted(contacts):
-                self.history_contact_combo.addItem(contact)
-
-            idx = self.history_contact_combo.findText(current)
-            if idx >= 0:
-                self.history_contact_combo.setCurrentIndex(idx)
-
-        except Exception:
-            pass
-
-    def setup_chat_tab(self, tab):
-        main_layout = QHBoxLayout()
-        main_layout.setContentsMargins(0, 0, 0, 0)
-        tab.setLayout(main_layout)
-
-        left_panel = QWidget()
-        left_panel.setMaximumWidth(240)
-        left_panel.setStyleSheet("background-color: #2f3136;")
-        left_layout = QVBoxLayout()
-        left_panel.setLayout(left_layout)
-
-        title = QLabel("📨 МЕССЕНДЖЕР")
-        title.setAlignment(Qt.AlignCenter)
-        title.setStyleSheet("font-size: 12pt; font-weight: bold; color: #ffffff; padding: 12px;")
-        left_layout.addWidget(title)
-
-        self.status_indicator = QLabel("🔴 Не подключен")
-        self.status_indicator.setAlignment(Qt.AlignCenter)
-        self.status_indicator.setStyleSheet("padding: 6px; font-size: 9pt;")
-        left_layout.addWidget(self.status_indicator)
-
-        line = QFrame()
-        line.setFrameShape(QFrame.HLine)
-        line.setStyleSheet("background-color: #40444b;")
-        left_layout.addWidget(line)
-
-        chats_label = QLabel("ДИАЛОГИ")
-        chats_label.setStyleSheet("padding: 8px 12px; color: #8e9297; font-size: 8pt;")
-        left_layout.addWidget(chats_label)
-
-        self.chats_list = QListWidget()
-        self.chats_list.itemClicked.connect(self.on_chat_selected)
-        left_layout.addWidget(self.chats_list)
-
-        new_chat_btn = QPushButton("+ Новый чат")
-        new_chat_btn.clicked.connect(self.add_new_chat)
-        left_layout.addWidget(new_chat_btn)
-
-        self.delete_chat_btn = QPushButton("🗑️ Удалить диалог")
-        self.delete_chat_btn.clicked.connect(self.delete_current_chat)
-        self.delete_chat_btn.setEnabled(False)
-        left_layout.addWidget(self.delete_chat_btn)
-
-        left_layout.addStretch()
-        main_layout.addWidget(left_panel)
-
-        right_panel = QWidget()
-        right_panel.setStyleSheet("background-color: #36393f;")
-        right_layout = QVBoxLayout()
-        right_panel.setLayout(right_layout)
-
-        self.chat_header = QLabel("Выберите диалог")
-        self.chat_header.setAlignment(Qt.AlignCenter)
-        self.chat_header.setStyleSheet("font-size: 14pt; font-weight: bold; color: #ffffff; padding: 12px; background-color: #2f3136;")
-        right_layout.addWidget(self.chat_header)
-
-        self.chat_display = QTextEdit()
-        self.chat_display.setReadOnly(True)
-        self.chat_display.setObjectName("chat_display")
-        right_layout.addWidget(self.chat_display)
-
-        input_frame = QFrame()
-        input_frame.setStyleSheet("background-color: #40444b; border-radius: 4px; margin: 8px;")
-        input_layout = QHBoxLayout()
-        input_frame.setLayout(input_layout)
-
-        self.message_input = QLineEdit()
-        self.message_input.setPlaceholderText("Введите сообщение...")
-        self.message_input.setMinimumHeight(36)
-        self.message_input.returnPressed.connect(self.send_chat_message)
-
-        self.send_chat_btn = QPushButton("📨 Отправить")
-        self.send_chat_btn.clicked.connect(self.send_chat_message)
-        self.send_chat_btn.setEnabled(False)
-
-        input_layout.addWidget(self.message_input)
-        input_layout.addWidget(self.send_chat_btn)
-        right_layout.addWidget(input_frame)
-
-        main_layout.addWidget(right_panel)
+    def _on_chat_menu_action(self, action: str) -> None:
+        if action == "open_menu":
+            menu = QMenu(self)
+            menu.addAction("\U0001F5D1\uFE0F Удалить диалог", self.delete_current_chat)
+            menu.exec_(self.chat_view.menu_btn.mapToGlobal(self.chat_view.menu_btn.rect().bottomRight()))
 
     def delete_current_chat(self):
         if not self.current_contact:
             QMessageBox.warning(self, "Ошибка", "Выберите диалог для удаления")
             return
 
-        reply = QMessageBox.question(self, "Удаление диалога",
-                                     f"Удалить диалог с {self.current_contact}? История переписки будет удалена.",
-                                     QMessageBox.Yes | QMessageBox.No)
+        reply = QMessageBox.question(
+            self, "Удаление диалога",
+            f"Удалить диалог с {self.current_contact}? История переписки будет удалена.",
+            QMessageBox.Yes | QMessageBox.No,
+        )
         if reply == QMessageBox.Yes:
             contact = self.current_contact
 
@@ -552,308 +1964,62 @@ class XMPPGUI(QMainWindow):
 
                 conn = sqlite3.connect('logs/messages.db')
                 cursor = conn.cursor()
-                cursor.execute("DELETE FROM messages WHERE sender LIKE ? OR recipient LIKE ?",
-                               (f'%{contact}%', f'%{contact}%'))
+                cursor.execute(
+                    "DELETE FROM messages WHERE sender LIKE ? OR recipient LIKE ?",
+                    (f'%{contact}%', f'%{contact}%'),
+                )
                 conn.commit()
                 conn.close()
 
                 self.current_contact = None
-                self.chat_header.setText("Выберите диалог")
-                self.send_chat_btn.setEnabled(False)
-                self.delete_chat_btn.setEnabled(False)
+                self.chat_view.clear_header()
+                self.chat_view.set_enabled_for_chat(False)
+                self.profile_panel.hide_panel()
                 self.refresh_chats_list()
-                self.chat_display.clear()
                 self.log_callback(f"Диалог с {contact} удален", "INFO")
-                self.load_history()
-                self.update_contacts_list()
+                self._history_dirty = True
 
-    def setup_logs_tab(self, tab):
-        layout = QVBoxLayout()
-        tab.setLayout(layout)
-
-        filter_layout = QHBoxLayout()
-        filter_layout.addWidget(QLabel("🔍 Фильтр:"))
-        self.log_filter = QComboBox()
-        self.log_filter.addItems(["Все", "Отправленные", "Полученные", "Ошибки"])
-        filter_layout.addWidget(self.log_filter)
-        filter_layout.addStretch()
-        layout.addLayout(filter_layout)
-
-        self.log_text = QTextEdit()
-        self.log_text.setReadOnly(True)
-        self.log_text.setFont(QFont("Consolas", 9))
-        self.log_text.setStyleSheet("background-color: #2f3136; color: #dcddde;")
-        layout.addWidget(self.log_text)
-
-        btn_layout = QHBoxLayout()
-        export_btn = QPushButton("📁 Экспорт JSON")
-        export_btn.clicked.connect(self.export_logs)
-        clear_btn = QPushButton("🗑️ Очистить")
-        clear_btn.clicked.connect(self.clear_logs_display)
-
-        btn_layout.addWidget(export_btn)
-        btn_layout.addWidget(clear_btn)
-        btn_layout.addStretch()
-        layout.addLayout(btn_layout)
-
-    def setup_settings_tab(self, tab):
-        layout = QVBoxLayout()
-        tab.setLayout(layout)
-
-        xmpp_group = QGroupBox("Настройки XMPP подключения")
-        xmpp_layout = QFormLayout()
-
-        self.xmpp_server = QLineEdit(self.config['xmpp']['server'])
-        self.xmpp_port = QSpinBox()
-        self.xmpp_port.setRange(1, 65535)
-        self.xmpp_port.setValue(self.config['xmpp']['port'])
-        self.xmpp_username = QLineEdit(self.config['xmpp']['username'])
-        self.xmpp_password = QLineEdit()
-        self.xmpp_password.setEchoMode(QLineEdit.Password)
-        self.xmpp_password.setText(self.config['xmpp']['password'])
-
-        xmpp_layout.addRow("🌐 Сервер:", self.xmpp_server)
-        xmpp_layout.addRow("🔌 Порт:", self.xmpp_port)
-        xmpp_layout.addRow("👤 Логин:", self.xmpp_username)
-        xmpp_layout.addRow("🔑 Пароль:", self.xmpp_password)
-
-        xmpp_group.setLayout(xmpp_layout)
-        layout.addWidget(xmpp_group)
-
-        rest_group = QGroupBox("Настройки REST API")
-        rest_layout = QFormLayout()
-
-        self.rest_host = QLineEdit(self.config['rest_api']['host'])
-        self.rest_port = QSpinBox()
-        self.rest_port.setRange(1, 65535)
-        self.rest_port.setValue(self.config['rest_api']['port'])
-        self.rest_endpoint = QLineEdit(self.config['rest_api']['endpoint'])
-        self.rest_api_key = QLineEdit(self.config['rest_api'].get('api_key', ''))
-        self.rest_api_key.setEchoMode(QLineEdit.Password)
-        self.rest_api_key.setPlaceholderText("Пусто = без авторизации (не рекомендуется для 0.0.0.0)")
-
-        self.verify_tls = QCheckBox("Проверять TLS-сертификат")
-        self.verify_tls.setChecked(self.config['xmpp'].get('verify_tls', False))
-
-        xmpp_layout.addRow(self.verify_tls)
-
-        rest_layout.addRow("🏠 Хост:", self.rest_host)
-        rest_layout.addRow("🔌 Порт:", self.rest_port)
-        rest_layout.addRow("📡 Endpoint:", self.rest_endpoint)
-        rest_layout.addRow("🔐 API ключ:", self.rest_api_key)
-
-        rest_group.setLayout(rest_layout)
-        layout.addWidget(rest_group)
-
-        btn_layout = QHBoxLayout()
-        btn_layout.setSpacing(10)
-
-        self.connect_btn = QPushButton("🔌 ПОДКЛЮЧИТЬСЯ")
-        self.connect_btn.clicked.connect(self.connect_xmpp)
-
-        self.register_btn = QPushButton("👤 Создать пользователя")
-        self.register_btn.clicked.connect(self.open_register_dialog)
-        self.register_btn.setEnabled(False)
-
-        self.start_rest_btn = QPushButton("🚀 ЗАПУСТИТЬ REST")
-        self.start_rest_btn.clicked.connect(self.start_rest)
-
-        self.save_btn = QPushButton("💾 Сохранить")
-        self.save_btn.clicked.connect(self.save_settings)
-
-        btn_layout.addWidget(self.connect_btn)
-        btn_layout.addWidget(self.register_btn)
-        btn_layout.addWidget(self.start_rest_btn)
-        btn_layout.addWidget(self.save_btn)
-        btn_layout.addStretch()
-
-        layout.addLayout(btn_layout)
-
-        status_frame = QFrame()
-        status_frame.setStyleSheet("background-color: #40444b; border-radius: 4px;")
-        status_layout = QVBoxLayout()
-        self.connection_status = QLabel("📡 Статус: Ожидание")
-        self.rest_status = QLabel("🌐 REST API: Остановлен")
-        status_layout.addWidget(self.connection_status)
-        status_layout.addWidget(self.rest_status)
-        status_frame.setLayout(status_layout)
-        layout.addWidget(status_frame)
-
-        layout.addStretch()
-
-    def setup_info_tab(self, tab):
-        layout = QVBoxLayout()
-        tab.setLayout(layout)
-
-        info_text = QTextEdit()
-        info_text.setReadOnly(True)
-        info_text.setStyleSheet("background-color: #2f3136; color: #dcddde;")
-        info_text.setHtml("""
-        <h1 style="color: #7289da;">📨 XMPP Мессенджер</h1>
-        <p><b>Версия:</b> 2.0</p>
-        <p><b>Протокол:</b> XMPP (Jabber)</p>
-        <p><b>API:</b> REST</p>
-        <h2 style="color: #7289da;">⚙️ Функции:</h2>
-        <ul>
-            <li>Полноценный чат с историей</li>
-            <li>Статусы сообщений: ✓ доставлено, ✓✓ прочитано</li>
-            <li>Подключение к XMPP серверу</li>
-            <li>REST API для внешних систем</li>
-            <li>Создание новых пользователей</li>
-            <li>История сообщений с фильтром по контактам</li>
-            <li>Автоочистка логов каждые 14 дней</li>
-            <li>Удаление диалогов</li>
-        </ul>
-        """)
-        layout.addWidget(info_text)
-
-    def save_settings(self):
-        self.config['xmpp']['server'] = self.xmpp_server.text()
-        self.config['xmpp']['port'] = self.xmpp_port.value()
-        self.config['xmpp']['username'] = self.xmpp_username.text()
-        self.config['xmpp']['password'] = self.xmpp_password.text()
-        self.config['rest_api']['host'] = self.rest_host.text()
-        self.config['rest_api']['port'] = self.rest_port.value()
-        self.config['rest_api']['endpoint'] = self.rest_endpoint.text()
-        self.config['rest_api']['api_key'] = self.rest_api_key.text().strip()
-        self.config['xmpp']['verify_tls'] = self.verify_tls.isChecked()
-        self.persist_settings()
-        self.log_callback("Настройки сохранены", "INFO")
-        QMessageBox.information(self, "Успех", "Настройки сохранены")
-
-    def add_new_chat(self):
-        contact, ok = QInputDialog.getText(self, "Новый чат",
-                                            "Введите JID пользователя (например: username@arsenal):")
-        if ok and contact:
-            if contact not in self.chats:
-                self.chats[contact] = []
-                self.save_chat_history()
-                self.refresh_chats_list()
-                self.log_callback(f"Начат чат с {contact}", "INFO")
-                self.current_contact = contact
-                self.chat_header.setText(f"💬 {contact}")
-                self.send_chat_btn.setEnabled(True)
-                self.delete_chat_btn.setEnabled(True)
-                self.refresh_chat_display()
-            else:
-                QMessageBox.warning(self, "Внимание", "Чат с этим пользователем уже существует")
-
-    def on_chat_selected(self, item):
-        contact = item.data(Qt.UserRole)
-        self.current_contact = contact
-        self.chat_header.setText(f"💬 {contact}")
-        self.send_chat_btn.setEnabled(True)
-        self.delete_chat_btn.setEnabled(True)
-        self.mark_messages_as_read(contact)
-        self.refresh_chat_display()
-        self.message_input.setFocus()
-
-    def mark_messages_as_read(self, contact):
-        """Отметить сообщения как прочитанные и отправить подтверждение"""
-        if contact in self.chats:
-            updated = False
-            for msg in self.chats[contact]:
-                if msg['type'] == 'received' and not msg.get('read', False):
-                    msg['read'] = True
-                    updated = True
-            if updated:
-                self.save_chat_history()
-                self.refresh_chats_list()
-                if self.current_contact == contact:
-                    self.refresh_chat_display()
-
-                try:
-                    if (
-                        self.xmpp_service
-                        and self.xmpp_service.client
-                        and self.xmpp_service.client.is_connected
-                    ):
-                        last_incoming_id = None
-                        for msg in reversed(self.chats.get(contact, [])):
-                            if msg.get('type') == 'received' and msg.get('msg_id'):
-                                last_incoming_id = msg['msg_id']
-                                break
-                        if last_incoming_id:
-                            self.xmpp_service.client.send_displayed_marker(
-                                contact, last_incoming_id
-                            )
-                            self.log_callback(
-                                f"✅ Отправлено подтверждение прочтения для {contact}", "INFO"
-                            )
-                except Exception as e:
-                    self.log_callback(f"Ошибка отправки подтверждения: {str(e)}", "ERROR")
+    # ---- protected: имя/поведение не менять, меняются только виджеты внутри ----
 
     def refresh_chats_list(self):
-        self.chats_list.clear()
-        for contact in self.chats.keys():
-            item = QListWidgetItem()
-            last_msg = ""
-            if self.chats[contact]:
-                last_msg = self.chats[contact][-1]['message'][:30]
-            unread = self.get_unread_count(contact)
-
-            if unread > 0:
-                item.setText(f"📩 {contact}\n{last_msg}")
-                item.setForeground(QColor(114, 137, 218))
-            else:
-                item.setText(f"💬 {contact}\n{last_msg}")
-
-            item.setData(Qt.UserRole, contact)
-            self.chats_list.addItem(item)
+        rows = []
+        for contact, messages in self.chats.items():
+            last_msg = messages[-1]["message"][:60] if messages else ""
+            last_time = messages[-1]["time"] if messages else ""
+            rows.append({
+                "jid": contact,
+                "name": contact,
+                "preview": last_msg,
+                "time": last_time,
+                "unread": self.get_unread_count(contact),
+            })
+        # Свежие диалоги — выше, как и раньше подразумевал порядок вставки в dict
+        self.sidebar.set_chats(rows)
 
     def get_unread_count(self, contact):
         if contact not in self.chats:
             return 0
         return sum(1 for msg in self.chats[contact]
-                  if msg.get('type') == 'received' and not msg.get('read', False))
+                   if msg.get('type') == 'received' and not msg.get('read', False))
 
     def refresh_chat_display(self):
         if not self.current_contact or self.current_contact not in self.chats:
-            self.chat_display.clear()
+            self.chat_view.set_messages([])
             return
 
-        self.chat_display.clear()
+        messages = self.chats[self.current_contact]
+        self.chat_view.set_messages(messages)
 
-        for msg in self.chats[self.current_contact]:
-            safe_text = html.escape(msg['message'])
-            if msg['type'] == 'sent':
-                if msg.get('status') == 'read':
-                    status_icon = "✓✓"
-                    status_color = "#43b581"
-                elif msg.get('status') == 'delivered':
-                    status_icon = "✓"
-                    status_color = "#8e9297"
-                elif msg.get('status') == 'failed':
-                    status_icon = "✗"
-                    status_color = "#f04747"
-                else:
-                    status_icon = "⏳"
-                    status_color = "#faa81a"
+        # Как и в исходной версии: открытый чат неявно помечает входящие read
+        # (реальную displayed-квитанцию по XMPP шлёт mark_messages_as_read).
+        changed = False
+        for msg in messages:
+            if msg["type"] == "received" and not msg.get("read", False):
+                msg["read"] = True
+                changed = True
+        if changed:
+            self.save_chat_history()
 
-                self.chat_display.append(
-                    f"<div style='text-align: right; margin: 8px 12px;'>"
-                    f"<div style='background-color: #40444b; color: #dcddde; display: inline-block; "
-                    f"padding: 8px 14px; border-radius: 18px; max-width: 70%; text-align: left; font-size: 9pt;'>"
-                    f"{safe_text}<br>"
-                    f"<span style='font-size: 7pt; color: #8e9297;'>{msg['time']} "
-                    f"<span style='color: {status_color};'>{status_icon}</span></span>"
-                    f"</div></div>"
-                )
-            else:
-                self.chat_display.append(
-                    f"<div style='text-align: left; margin: 8px 12px;'>"
-                    f"<div style='background-color: #2f3136; color: #dcddde; display: inline-block; "
-                    f"padding: 8px 14px; border-radius: 18px; max-width: 70%; text-align: left; font-size: 9pt;'>"
-                    f"{safe_text}<br>"
-                    f"<span style='font-size: 7pt; color: #8e9297;'>{msg['time']}</span>"
-                    f"</div></div>"
-                )
-                if not msg.get('read', False):
-                    msg['read'] = True
-                    self.save_chat_history()
-
-        scrollbar = self.chat_display.verticalScrollBar()
-        scrollbar.setValue(scrollbar.maximum())
         self.refresh_chats_list()
 
     def send_chat_message(self):
@@ -865,7 +2031,7 @@ class XMPPGUI(QMainWindow):
             QMessageBox.warning(self, "Ошибка", "Нет подключения к XMPP серверу")
             return
 
-        message = self.message_input.text().strip()
+        message = self.chat_view.message_input.toPlainText().strip()
         if not message:
             return
 
@@ -886,12 +2052,12 @@ class XMPPGUI(QMainWindow):
                 'message': message,
                 'time': datetime.now().strftime("%H:%M:%S"),
                 'status': 'sending',
-                'msg_id': msg_id
+                'msg_id': msg_id,
             })
             self.pending_messages[msg_id] = self.current_contact
             self.save_chat_history()
             self.refresh_chat_display()
-            self.message_input.clear()
+            self.chat_view.clear_input()
 
             self.xmpp_service.client.queue_message(
                 self.current_contact, message, msg_id=msg_id
@@ -901,6 +2067,11 @@ class XMPPGUI(QMainWindow):
         except Exception as e:
             self.update_message_status(msg_id, 'failed')
             QMessageBox.critical(self, "Ошибка", f"Не удалось отправить: {str(e)}")
+
+    def _on_send_requested(self, _text: str) -> None:
+        """ChatViewWidget сам не отправляет — просит XMPPGUI сделать это по имени
+        send_chat_message (имя/поведение метода не меняется)."""
+        self.send_chat_message()
 
     def update_message_status(self, msg_id, status):
         contact = self.pending_messages.get(msg_id)
@@ -936,6 +2107,41 @@ class XMPPGUI(QMainWindow):
                 if self.current_contact == contact:
                     self.refresh_chat_display()
 
+    def mark_messages_as_read(self, contact):
+        """Отметить сообщения как прочитанные и отправить подтверждение"""
+        if contact in self.chats:
+            updated = False
+            for msg in self.chats[contact]:
+                if msg['type'] == 'received' and not msg.get('read', False):
+                    msg['read'] = True
+                    updated = True
+            if updated:
+                self.save_chat_history()
+                self.refresh_chats_list()
+                if self.current_contact == contact:
+                    self.refresh_chat_display()
+
+                try:
+                    if (
+                        self.xmpp_service
+                        and self.xmpp_service.client
+                        and self.xmpp_service.client.is_connected
+                    ):
+                        last_incoming_id = None
+                        for msg in reversed(self.chats.get(contact, [])):
+                            if msg.get('type') == 'received' and msg.get('msg_id'):
+                                last_incoming_id = msg['msg_id']
+                                break
+                        if last_incoming_id:
+                            self.xmpp_service.client.send_displayed_marker(
+                                contact, last_incoming_id
+                            )
+                            self.log_callback(
+                                f"\u2705 Отправлено подтверждение прочтения для {contact}", "INFO"
+                            )
+                except Exception as e:
+                    self.log_callback(f"Ошибка отправки подтверждения: {str(e)}", "ERROR")
+
     # --- Публичные обработчики, вызываемые из потоков (только emit!) ---
 
     def on_delivery_received(self, msg_id):
@@ -964,14 +2170,16 @@ class XMPPGUI(QMainWindow):
     @pyqtSlot(str)
     def _on_delivery_received_safe(self, msg_id):
         self.logger.mark_delivered(msg_id)
-        self.log_callback(f"✓ Доставлено: {msg_id}", "INFO")
+        self.log_callback(f"\u2713 Доставлено: {msg_id}", "INFO")
         self.update_message_status(msg_id, 'delivered')
 
     @pyqtSlot(str)
     def _on_receipt_received_safe(self, msg_id):
-        self.log_callback(f'DEBUG read: msg_id={msg_id} pending={list(self.pending_messages.keys())[:5]}', 'INFO')
+        self.log_callback(
+            f'DEBUG read: msg_id={msg_id} pending={list(self.pending_messages.keys())[:5]}', 'INFO'
+        )
         self.logger.mark_read(msg_id)
-        self.log_callback(f"✓✓ Прочитано: {msg_id}", "INFO")
+        self.log_callback(f"\u2713\u2713 Прочитано: {msg_id}", "INFO")
         self.update_message_status(msg_id, 'read')
 
     @pyqtSlot(str, str, str)
@@ -995,13 +2203,12 @@ class XMPPGUI(QMainWindow):
                 'message': message,
                 'time': datetime.now().strftime("%H:%M:%S"),
                 'read': False,
-                'msg_id': msg_id
+                'msg_id': msg_id,
             })
             self.save_chat_history()
 
-            self.log_callback(f"📩 Получено сообщение от {from_jid}: {message}", "INFO")
+            self.log_callback(f"\U0001F4E9 Получено сообщение от {from_jid}: {message}", "INFO")
 
-            # Отложенное обновление истории (не дёргаем GUI каждое сообщение)
             self._history_dirty = True
             self.refresh_chats_list()
 
@@ -1010,14 +2217,18 @@ class XMPPGUI(QMainWindow):
                 if msg_id and self.xmpp_service and self.xmpp_service.client and self.xmpp_service.client.is_connected:
                     self.xmpp_service.client.send_displayed_marker(from_jid, msg_id)
             else:
-                self.status_label.setText(f"📩 Новое сообщение от {from_jid}")
-                QTimer.singleShot(3000, lambda: self.status_label.setText(f"🟢 Подключено"))
+                self.status_label.setText(f"\U0001F4E9 Новое сообщение от {from_jid}")
+                QTimer.singleShot(3000, lambda: self.status_label.setText("\U0001F7E2 Подключено"))
         except Exception as e:
             self.log_callback(f"Ошибка обработки сообщения: {str(e)}", "ERROR")
 
+    # ================================================================== подключение / REST
+
     def connect_xmpp(self):
-        username = self.xmpp_username.text().strip()
-        password = self.xmpp_password.text()
+        # Решение 1 из docstring: логин/пароль читаются из self.config,
+        # а не из виджета настроек (тот теперь не живёт постоянно).
+        username = self.config.get("xmpp", {}).get("username", "").strip()
+        password = self.config.get("xmpp", {}).get("password", "")
 
         if not username or not password:
             QMessageBox.warning(self, "Ошибка", "Введите логин и пароль в настройках")
@@ -1026,8 +2237,7 @@ class XMPPGUI(QMainWindow):
         if getattr(self, "_connect_worker", None) and self._connect_worker.isRunning():
             return
 
-        self.connect_btn.setText("⏳ ПОДКЛЮЧЕНИЕ...")
-        self.connect_btn.setEnabled(False)
+        self.status_label.setText("\u23F3 Подключение...")
         self.log_callback("Подключение к XMPP...", "INFO")
 
         self._connect_worker = XmppConnectWorker(
@@ -1037,14 +2247,11 @@ class XMPPGUI(QMainWindow):
         self._connect_worker.start()
 
     def _on_xmpp_connect_finished(self, success: bool, error: str):
-        username = self.xmpp_username.text().strip()
+        username = self.config.get("xmpp", {}).get("username", "").strip()
 
         if success and self._connect_worker.service:
             self.xmpp_service = self._connect_worker.service
-            self.status_indicator.setText("🟢 Подключен")
-            self.status_indicator.setStyleSheet("padding: 6px; color: #43b581;")
-            self.status_label.setText(f"🟢 Подключено: {username}")
-            self.connect_btn.setText("✅ ПОДКЛЮЧЕНО")
+            self.status_label.setText(f"\U0001F7E2 Подключено: {username}")
             self.log_callback("Подключено к XMPP серверу", "INFO")
 
             self.xmpp_service.client.on_message_received = self.receive_message
@@ -1052,11 +2259,10 @@ class XMPPGUI(QMainWindow):
             self.xmpp_service.client.on_read_received = self.on_receipt_received
             self.xmpp_service.client.on_send_failed = self.on_send_failed
 
-            self.register_btn.setEnabled(True)
-            self.update_contacts_list()
+            if self.history_dialog is not None:
+                self.history_dialog.refresh_contacts(username)
         else:
-            self.connect_btn.setText("🔌 ПОДКЛЮЧИТЬСЯ")
-            self.connect_btn.setEnabled(True)
+            self.status_label.setText("\U0001F534 Не подключено")
             msg = error or "Не удалось подключиться к серверу"
             self.log_callback(msg, "ERROR")
             QMessageBox.critical(self, "Ошибка", msg)
@@ -1069,10 +2275,8 @@ class XMPPGUI(QMainWindow):
         dialog = QDialog(self)
         dialog.setWindowTitle("Регистрация нового пользователя")
         dialog.setGeometry(200, 200, 400, 300)
-        dialog.setStyleSheet("background-color: #2f3136; color: #dcddde;")
 
         layout = QVBoxLayout()
-
         form_layout = QFormLayout()
 
         username_edit = QLineEdit()
@@ -1086,21 +2290,18 @@ class XMPPGUI(QMainWindow):
         email_edit = QLineEdit()
         email_edit.setPlaceholderText("email (необязательно)")
 
-        form_layout.addRow("👤 Логин:", username_edit)
-        form_layout.addRow("🔑 Пароль:", password_edit)
-        form_layout.addRow("🔑 Подтверждение:", confirm_edit)
-        form_layout.addRow("📧 Email:", email_edit)
-
+        form_layout.addRow("\U0001F464 Логин:", username_edit)
+        form_layout.addRow("\U0001F511 Пароль:", password_edit)
+        form_layout.addRow("\U0001F511 Подтверждение:", confirm_edit)
+        form_layout.addRow("\U0001F4E7 Email:", email_edit)
         layout.addLayout(form_layout)
 
         btn_layout = QHBoxLayout()
-        register_btn = QPushButton("✅ Зарегистрировать")
-        cancel_btn = QPushButton("❌ Отмена")
-
+        register_btn = QPushButton("\u2705 Зарегистрировать")
+        cancel_btn = QPushButton("\u274C Отмена")
         btn_layout.addWidget(register_btn)
         btn_layout.addWidget(cancel_btn)
         layout.addLayout(btn_layout)
-
         dialog.setLayout(layout)
 
         def do_register():
@@ -1112,11 +2313,9 @@ class XMPPGUI(QMainWindow):
             if not username or not password:
                 QMessageBox.warning(dialog, "Ошибка", "Введите логин и пароль")
                 return
-
             if password != confirm:
                 QMessageBox.warning(dialog, "Ошибка", "Пароли не совпадают")
                 return
-
             if len(password) < 4:
                 QMessageBox.warning(dialog, "Ошибка", "Пароль должен быть не менее 4 символов")
                 return
@@ -1125,7 +2324,11 @@ class XMPPGUI(QMainWindow):
                 success = self.xmpp_service.register_user(username, password, email)
                 if success:
                     self.log_callback(f"Запрос на регистрацию пользователя {username} отправлен", "INFO")
-                    QMessageBox.information(dialog, "Успех", f"Запрос на регистрацию пользователя {username} отправлен.\nЕсли сервер поддерживает регистрацию, пользователь будет создан.")
+                    QMessageBox.information(
+                        dialog, "Успех",
+                        f"Запрос на регистрацию пользователя {username} отправлен.\n"
+                        f"Если сервер поддерживает регистрацию, пользователь будет создан.",
+                    )
                     dialog.accept()
                 else:
                     QMessageBox.critical(dialog, "Ошибка", "Не удалось отправить запрос регистрации")
@@ -1134,7 +2337,6 @@ class XMPPGUI(QMainWindow):
 
         register_btn.clicked.connect(do_register)
         cancel_btn.clicked.connect(dialog.reject)
-
         dialog.exec_()
 
     def start_rest(self):
@@ -1142,10 +2344,6 @@ class XMPPGUI(QMainWindow):
             if self.rest_server and self.rest_server.is_running:
                 QMessageBox.information(self, "Инфо", "REST API уже запущен")
                 return
-
-            self.start_rest_btn.setText("⏳ ЗАПУСК...")
-            self.start_rest_btn.setEnabled(False)
-            self.start_rest_btn.repaint()
 
             def message_handler(to_user, message, priority="normal", msg_id=None):
                 """Вызывается из потока REST-сервера. GUI трогать нельзя!"""
@@ -1162,7 +2360,6 @@ class XMPPGUI(QMainWindow):
 
                     msg_id = msg_id or str(uuid.uuid4())
 
-                    # Работа с chats — под локом (не GUI)
                     with self.chats_lock:
                         if to_user not in self.chats:
                             self.chats[to_user] = []
@@ -1171,20 +2368,17 @@ class XMPPGUI(QMainWindow):
                             'message': message,
                             'time': datetime.now().strftime("%H:%M:%S"),
                             'status': 'sending',
-                            'msg_id': msg_id
+                            'msg_id': msg_id,
                         })
                     with self.pending_messages_lock:
                         self.pending_messages[msg_id] = to_user
 
-                    # Файл — можно из потока
                     self.save_chat_history()
 
-                    # Отправка через XMPP
                     result = self.xmpp_service.send_message(
                         to_user, message, msg_id=msg_id, priority=priority
                     )
 
-                    # GUI — ТОЛЬКО через сигнал!
                     self.sig_message_sent.emit(to_user, message, msg_id)
 
                     return msg_id if result is not None else None
@@ -1198,14 +2392,12 @@ class XMPPGUI(QMainWindow):
             )
             self.rest_server.start()
 
-            self.start_rest_btn.setText("✅ ЗАПУЩЕНО")
-            self.rest_status.setText(f"✅ REST API: Запущен на порту {self.config['rest_api']['port']}")
             self.log_callback(f"REST API запущен на порту {self.config['rest_api']['port']}", "INFO")
-            QMessageBox.information(self, "Успех", f"REST API запущен на порту {self.config['rest_api']['port']}")
+            QMessageBox.information(
+                self, "Успех", f"REST API запущен на порту {self.config['rest_api']['port']}"
+            )
 
         except Exception as e:
-            self.start_rest_btn.setText("🚀 ЗАПУСТИТЬ REST")
-            self.start_rest_btn.setEnabled(True)
             self.log_callback(f"Ошибка запуска REST: {str(e)}", "ERROR")
             QMessageBox.critical(self, "Ошибка", f"Ошибка: {str(e)}")
 
@@ -1215,9 +2407,6 @@ class XMPPGUI(QMainWindow):
             QMessageBox.information(self, "Успех", f"Логи экспортированы в:\n{filepath}")
         except Exception as e:
             QMessageBox.critical(self, "Ошибка", f"Ошибка экспорта: {str(e)}")
-
-    def clear_logs_display(self):
-        self.log_text.clear()
 
     def check_for_updates(self):
         try:
@@ -1241,8 +2430,9 @@ class XMPPGUI(QMainWindow):
             webbrowser.open(download_url if download_url else "https://github.com/Ottiks17/XMPP2/releases/latest")
 
     def auto_start(self):
-        username = self.xmpp_username.text()
-        password = self.xmpp_password.text()
+        # Решение 1 из docstring: тоже читаем из self.config.
+        username = self.config.get("xmpp", {}).get("username", "")
+        password = self.config.get("xmpp", {}).get("password", "")
 
         if username and password:
             self.log_callback("Автоматическое подключение к XMPP...", "INFO")
@@ -1277,7 +2467,7 @@ class XMPPGUI(QMainWindow):
                 msg_data = json.loads(message)
                 display_message = (
                     f"{msg_data.get('type', '?')} "
-                    f"{msg_data.get('sender', '?')} → {msg_data.get('recipient', '?')}: "
+                    f"{msg_data.get('sender', '?')} \u2192 {msg_data.get('recipient', '?')}: "
                     f"{msg_data.get('message', '')[:80]}"
                 )
                 self.logger.log_message(
@@ -1288,33 +2478,34 @@ class XMPPGUI(QMainWindow):
                     message_id=msg_data.get('message_id'),
                     priority=msg_data.get('priority'),
                     send_time=datetime.fromisoformat(msg_data['send_time'])
-                    if msg_data.get('send_time')
-                    else None,
+                    if msg_data.get('send_time') else None,
                     delivery_time=datetime.fromisoformat(msg_data['delivery_time'])
-                    if msg_data.get('delivery_time')
-                    else None,
+                    if msg_data.get('delivery_time') else None,
                     read_time=datetime.fromisoformat(msg_data['read_time'])
-                    if msg_data.get('read_time')
-                    else None,
+                    if msg_data.get('read_time') else None,
                 )
             except (json.JSONDecodeError, KeyError, ValueError, TypeError):
                 display_message = message
 
-        color = "#dcddde"
+        color = "#7f91a4"
         if level == "ERROR":
-            color = "#f04747"
+            color = "#e53935"
         elif level == "MESSAGE":
-            color = "#43b581"
+            color = "#4dcd5e"
 
         safe_display = html.escape(display_message)
         log_entry = (
-            f'<span style="color: #8e9297;">[{timestamp}]</span> '
+            f'<span style="color: #7f91a4;">[{timestamp}]</span> '
             f'<span style="color: {color};">[{level}]</span> {safe_display}<br>'
         )
 
-        self.log_text.append(log_entry)
-        scrollbar = self.log_text.verticalScrollBar()
-        scrollbar.setValue(scrollbar.maximum())
+        # --- решение 3 из docstring: log_text больше не существует постоянно,
+        #     пишем в буфер и форвардим в LogsDialog, если он открыт ---
+        self._log_entries.append(log_entry)
+        if len(self._log_entries) > 5000:
+            self._log_entries = self._log_entries[-5000:]
+        if self.logs_dialog is not None and self.logs_dialog.isVisible():
+            self.logs_dialog.append_entry(log_entry)
 
         try:
             with open("logs/app.log", "a", encoding='utf-8') as f:
