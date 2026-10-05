@@ -1,193 +1,240 @@
-"""REST API server for sending messages via XMPP with rate limiting."""
+"""Тесты REST API — против реального rest_server.RESTServer.
 
-import threading
-import time
-from collections import defaultdict
+Раньше этот файл содержал самодостаточную копию сервера и не проверял
+продакшен-код. Теперь тесты строят реальный RESTServer и ходят по нему через
+Flask test_client, покрывая /send_message, /broadcast, /health, /stats,
+авторизацию по X-API-Key и ограничение частоты запросов.
+"""
+import json
+import os
+import tempfile
 
-from flask import Flask, request, jsonify
-
-
-# ---------------------------------------------------------------------- #
-#  Rate limiter
-# ---------------------------------------------------------------------- #
-
-class RateLimiter:
-    """Simple in-memory rate limiter keyed by client IP."""
-
-    def __init__(self, max_requests=100, window_seconds=60):
-        self.max_requests = max_requests
-        self.window_seconds = window_seconds
-        self._hits = defaultdict(list)
-        self._lock = threading.Lock()
-
-    def is_allowed(self, ip):
-        """Return True if the request from `ip` is within the rate limit."""
-        now = time.time()
-        with self._lock:
-            timestamps = self._hits[ip]
-            cutoff = now - self.window_seconds
-            # Drop timestamps outside the current window
-            timestamps[:] = [t for t in timestamps if t > cutoff]
-
-            if len(timestamps) >= self.max_requests:
-                return False
-
-            timestamps.append(now)
-            return True
+import rest_server
+from app.storage import MessageLogger
+from rest_server import RESTServer
 
 
-# ---------------------------------------------------------------------- #
-#  REST server
-# ---------------------------------------------------------------------- #
+_NO_HANDLER = object()
 
-class RESTServer:
-    """REST API server wrapping a Flask application."""
 
-    def __init__(self, config, message_handler=None, log_callback=None):
-        self.config = config or {}
-        self.message_handler = message_handler
-        self.log_callback = log_callback or (lambda msg, level: None)
+def _make_server(tmp, api_key="", message_handler=_NO_HANDLER, allow_get=False,
+                 **rest_overrides):
+    """Собирает RESTServer с временной БД и возвращает (server, client, logger)."""
+    logger = MessageLogger(db_path=os.path.join(tmp, "t.db"))
+    if message_handler is _NO_HANDLER:
+        message_handler = lambda *a, **kw: True
+    config = {
+        "rest_api": {
+            "host": "127.0.0.1",
+            "port": 8080,
+            "endpoint": "/send_message",
+            "api_key": api_key,
+            "allow_get": allow_get,
+            **rest_overrides,
+        }
+    }
+    server = RESTServer(config, message_handler=message_handler, message_logger=logger)
+    return server, server.app.test_client(), logger
 
-        rest_cfg = self.config.get('rest_api', {}) or {}
-        rate_cfg = rest_cfg.get('rate_limit', {}) or {}
 
-        self.host = rest_cfg.get('host', '127.0.0.1')
-        self.port = rest_cfg.get('port', 8080)
-        self.endpoint = rest_cfg.get('endpoint', '/send_message')
-        self.api_key = rest_cfg.get('api_key', '')
-        self.allow_get = rest_cfg.get('allow_get', False)
-
-        # Flask app + rate limiter as an app attribute
-        # (tests access `client.application.rate_limiter`)
-        self.app = Flask(__name__)
-        self.app.rate_limiter = RateLimiter(
-            max_requests=rate_cfg.get('max_requests', 100),
-            window_seconds=rate_cfg.get('window_seconds', 60),
-        )
-
-        # Register routes and hooks
-        self._register_security_headers()
-        self._register_routes()
-
-    # ------------------------------------------------------------------ #
-    #  Internals
-    # ------------------------------------------------------------------ #
-
-    def _log(self, msg, level='INFO'):
-        """Safely invoke the log callback."""
-        try:
-            self.log_callback(msg, level)
-        except Exception:
-            pass
-
-    def _register_security_headers(self):
-        @self.app.after_request
-        def _add_security_headers(response):
-            response.headers['X-Content-Type-Options'] = 'nosniff'
-            response.headers['X-Frame-Options'] = 'DENY'
-            response.headers['X-XSS-Protection'] = '1; mode=block'
-            response.headers['Content-Security-Policy'] = "default-src 'self'"
-            return response
-
-    def _register_routes(self):
-        # -------------------------------------------------------------- #
-        #  /health
-        # -------------------------------------------------------------- #
-        @self.app.route('/health', methods=['GET'])
-        def health():
-            return jsonify({"status": "running"}), 200
-
-        # -------------------------------------------------------------- #
-        #  /send_message
-        # -------------------------------------------------------------- #
-        @self.app.route(self.endpoint, methods=['POST'])
-        def send_message():
-            # 1. API key check ----------------------------------------- #
-            provided_key = request.headers.get('X-API-Key')
-            if not self.api_key or provided_key != self.api_key:
-                return jsonify({"error": "Unauthorized"}), 401
-
-            # 2. Rate limiting ----------------------------------------- #
-            client_ip = request.remote_addr or 'unknown'
-            if not self.app.rate_limiter.is_allowed(client_ip):
-                return jsonify({"error": "Too many requests"}), 429
-
-            # 3. Payload validation (BEFORE handler check) ------------- #
-            data = request.get_json(silent=True) or {}
-            if 'to' not in data or 'message' not in data:
-                return jsonify(
-                    {"error": "Missing required fields: 'to' and 'message'"}
-                ), 400
-
-            to_user = data['to']
-            message = data['message']
-
-            if not isinstance(message, str) or not message.strip():
-                return jsonify({"error": "Message cannot be empty"}), 400
-
-            if len(message) > 256:
-                return jsonify(
-                    {"error": "Message exceeds 256 characters"}
-                ), 400
-
-            # 4. Handler check ----------------------------------------- #
-            if self.message_handler is None:
-                self._log('[REST API] Message handler not configured', 'ERROR')
-                return jsonify(
-                    {"error": "Message handler not configured"}
-                ), 500
-
-            # 5. Send -------------------------------------------------- #
-            try:
-                ok = self.message_handler(to_user, message)
-            except Exception as exc:
-                self._log(f'[REST API] Handler error: {exc}', 'ERROR')
-                return jsonify({"error": f"Handler error: {exc}"}), 500
-
-            if not ok:
-                return jsonify({"error": "Failed to send message"}), 502
-
-            return jsonify({"status": "success"}), 200
-
-    # ------------------------------------------------------------------ #
-    #  Public API
-    # ------------------------------------------------------------------ #
-
-    def set_message_handler(self, handler):
-        """Assign (or replace) the message handler."""
-        self.message_handler = handler
-
-    def start(self):
-        """Start the Flask server (blocking)."""
-        self._log(
-            f'[REST API] Listening on {self.host}:{self.port}{self.endpoint}'
-        )
-        self.app.run(host=self.host, port=self.port, threaded=True)
-
-    def start_in_thread(self):
-        """Start the Flask server in a daemon thread."""
-        t = threading.Thread(target=self.start, daemon=True)
-        t.start()
-        return t
+def _post(client, headers=None, **body):
+    return client.post("/send_message", json=body, headers=headers or {})
 
 
 # ---------------------------------------------------------------------- #
-#  Standalone entry point (optional)
+#  /send_message
 # ---------------------------------------------------------------------- #
 
-if __name__ == '__main__':
-    import yaml  # optional dependency for standalone use
+def test_send_message_success():
+    with tempfile.TemporaryDirectory() as tmp:
+        _, client, _ = _make_server(tmp)
+        r = _post(client, to="user@arsenal", message="hello")
+        assert r.status_code == 200
+        data = r.get_json()
+        assert data["status"] == "success"
+        assert data["message_id"]
+        assert data["priority"] == "normal"
+        assert data["to"] == "user@arsenal"
 
-    with open('config.yaml', 'r', encoding='utf-8') as f:
-        cfg = yaml.safe_load(f)
 
-    def _demo_handler(to_user, message):
-        print(f'>>> {to_user}: {message}')
+def test_send_message_missing_to_returns_400():
+    with tempfile.TemporaryDirectory() as tmp:
+        _, client, _ = _make_server(tmp)
+        assert _post(client, message="hello").status_code == 400
+
+
+def test_send_message_empty_body_returns_400():
+    with tempfile.TemporaryDirectory() as tmp:
+        _, client, _ = _make_server(tmp)
+        assert client.post("/send_message").status_code == 400  # нет JSON-тела
+
+
+def test_send_message_too_long_returns_400():
+    with tempfile.TemporaryDirectory() as tmp:
+        _, client, _ = _make_server(tmp)
+        r = _post(client, to="user@arsenal", message="x" * 257)
+        assert r.status_code == 400
+
+
+def test_send_message_bad_priority_returns_400():
+    with tempfile.TemporaryDirectory() as tmp:
+        _, client, _ = _make_server(tmp)
+        r = _post(client, to="user@arsenal", message="hi", priority="urgent")
+        assert r.status_code == 400
+
+
+def test_send_message_payload_without_message_field_is_sent_as_json():
+    """Отсутствие поля message не даёт 400: остальной payload уходит JSON-строкой."""
+    calls = []
+
+    def handler(to_user, message, priority, msg_id):
+        calls.append((to_user, message, priority, msg_id))
         return True
 
-    server = RESTServer(
-        cfg,
-        message_handler=_demo_handler,
-        log_callback=lambda msg, level: print(f'[{level}] {msg}'),
-    )
-    server.start()
+    with tempfile.TemporaryDirectory() as tmp:
+        _, client, _ = _make_server(tmp, message_handler=handler)
+        r = _post(client, to="user@arsenal", custom="payload")
+        assert r.status_code == 200
+        assert json.loads(calls[0][1]) == {"to": "user@arsenal", "custom": "payload"}
+
+
+def test_send_message_handler_not_configured_returns_500():
+    with tempfile.TemporaryDirectory() as tmp:
+        _, client, _ = _make_server(tmp, message_handler=None)
+        r = _post(client, to="user@arsenal", message="hi")
+        assert r.status_code == 500
+
+
+def test_send_message_handler_returns_false_returns_500():
+    with tempfile.TemporaryDirectory() as tmp:
+        _, client, _ = _make_server(tmp, message_handler=lambda *a: False)
+        assert _post(client, to="user@arsenal", message="hi").status_code == 500
+
+
+def test_send_message_handler_raises_returns_500():
+    def handler(*a):
+        raise RuntimeError("boom")
+
+    with tempfile.TemporaryDirectory() as tmp:
+        _, client, _ = _make_server(tmp, message_handler=handler)
+        assert _post(client, to="user@arsenal", message="hi").status_code == 500
+
+
+# ---------------------------------------------------------------------- #
+#  Авторизация по X-API-Key
+# ---------------------------------------------------------------------- #
+
+def test_api_key_required():
+    with tempfile.TemporaryDirectory() as tmp:
+        _, client, _ = _make_server(tmp, api_key="secret")
+        assert _post(client, to="user@arsenal", message="hi").status_code == 401
+        assert _post(client, to="user@arsenal", message="hi",
+                     headers={"X-API-Key": "wrong"}).status_code == 401
+        assert _post(client, to="user@arsenal", message="hi",
+                     headers={"X-API-Key": "secret"}).status_code == 200
+
+
+def test_api_key_via_query_param():
+    with tempfile.TemporaryDirectory() as tmp:
+        _, client, _ = _make_server(tmp, api_key="secret")
+        r = client.post("/send_message?api_key=secret",
+                        json={"to": "user@arsenal", "message": "hi"})
+        assert r.status_code == 200
+
+
+def test_no_api_key_configured_skips_auth():
+    with tempfile.TemporaryDirectory() as tmp:
+        _, client, _ = _make_server(tmp)
+        assert _post(client, to="user@arsenal", message="hi").status_code == 200
+
+
+# ---------------------------------------------------------------------- #
+#  GET-режим и rate limiting
+# ---------------------------------------------------------------------- #
+
+def test_get_disabled_by_default():
+    with tempfile.TemporaryDirectory() as tmp:
+        _, client, _ = _make_server(tmp)
+        assert client.get("/send_message?to=a@arsenal&message=hi").status_code == 405
+
+
+def test_get_allowed_when_configured():
+    with tempfile.TemporaryDirectory() as tmp:
+        _, client, _ = _make_server(tmp, allow_get=True)
+        r = client.get("/send_message?to=a@arsenal&message=hi")
+        assert r.status_code == 200
+
+
+def test_rate_limiter_unit():
+    rl = rest_server.RateLimiter(max_requests=2, window_seconds=60)
+    assert rl.is_allowed("1.1.1.1") is True
+    assert rl.is_allowed("1.1.1.1") is True
+    assert rl.is_allowed("1.1.1.1") is False
+    assert rl.is_allowed("2.2.2.2") is True  # другой IP не ограничен
+
+
+def test_rate_limiter_expires_old_requests(monkeypatch):
+    now = [1000.0]
+    monkeypatch.setattr(rest_server, "time", lambda: now[0])
+    rl = rest_server.RateLimiter(max_requests=1, window_seconds=60)
+    assert rl.is_allowed("1.1.1.1") is True
+    assert rl.is_allowed("1.1.1.1") is False
+    now[0] = 1100.0  # за пределами окна
+    assert rl.is_allowed("1.1.1.1") is True
+
+
+def test_send_message_rate_limited_returns_429():
+    with tempfile.TemporaryDirectory() as tmp:
+        server, client, _ = _make_server(tmp)
+        server.rate_limiter.max_requests = 2
+        assert _post(client, to="a@arsenal", message="1").status_code == 200
+        assert _post(client, to="a@arsenal", message="2").status_code == 200
+        assert _post(client, to="a@arsenal", message="3").status_code == 429
+
+
+# ---------------------------------------------------------------------- #
+#  /health, /stats, /broadcast
+# ---------------------------------------------------------------------- #
+
+def test_health_no_auth():
+    with tempfile.TemporaryDirectory() as tmp:
+        _, client, _ = _make_server(tmp, api_key="secret")
+        r = client.get("/health")
+        assert r.status_code == 200
+        assert r.get_json() == {"status": "running"}
+
+
+def test_stats_counts(monkeypatch):
+    with tempfile.TemporaryDirectory() as tmp:
+        _, client, _ = _make_server(tmp)
+        _post(client, to="user@arsenal", message="hi")
+        monkeypatch.setattr(rest_server, "MESSAGES_DB_PATH", os.path.join(tmp, "t.db"))
+        r = client.get("/stats")
+        assert r.status_code == 200
+        stats = r.get_json()["stats"]
+        assert stats["total_messages"] >= 1
+
+
+def test_broadcast_success():
+    with tempfile.TemporaryDirectory() as tmp:
+        _, client, _ = _make_server(tmp)
+        r = client.post("/broadcast", json={
+            "recipients": ["a@arsenal", "b@arsenal"],
+            "message": "hi",
+            "priority": "high",
+        })
+        assert r.status_code == 200
+        data = r.get_json()
+        assert data["total"] == 2 and data["success"] == 2 and data["failed"] == 0
+        ids = [item["message_id"] for item in data["results"]]
+        assert len(set(ids)) == 2  # у каждого получателя свой id
+
+
+def test_broadcast_missing_fields_returns_400():
+    with tempfile.TemporaryDirectory() as tmp:
+        _, client, _ = _make_server(tmp)
+        assert client.post("/broadcast", json={"recipients": []}).status_code == 400
+        assert client.post("/broadcast", json={"message": "hi"}).status_code == 400
+        assert client.post("/broadcast", json={
+            "recipients": "a@arsenal", "message": "hi",
+        }).status_code == 400  # recipients не список

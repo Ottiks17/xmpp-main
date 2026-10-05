@@ -512,7 +512,7 @@ class RESTServer:
                     message = request.args.get('message')
                     raw_priority = request.args.get('priority')
                 else:
-                    data = request.get_json()
+                    data = request.get_json(silent=True)
                     if not data:
                         return jsonify({"error": "No JSON data provided"}), 400
                     

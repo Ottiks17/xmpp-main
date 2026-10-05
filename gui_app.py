@@ -44,6 +44,7 @@ import json
 import os
 import sqlite3
 import sys
+import time
 import uuid
 from datetime import datetime
 from threading import Lock
@@ -116,7 +117,7 @@ from app.validation import validate_message
 from app.xmpp.service import XMPPService
 from app.kafka_broker import KafkaBroker
 from rest_server import RESTServer
-from logger import MessageLogger
+from app.storage import MessageLogger
 
 os.environ['LANG'] = 'ru_RU.UTF-8'
 
@@ -1861,10 +1862,11 @@ class XMPPGUI(QMainWindow):
         QMessageBox.information(self, "Мой профиль", f"\U0001F464 {username}@{server}")
 
     def _show_about(self) -> None:
+        from version import VERSION
         QMessageBox.about(
             self, "О программе",
             "<h2 style='color:#5288c1;'>\U0001F4E8 XMPP Мессенджер</h2>"
-            "<p><b>Версия:</b> 2.0</p>"
+            f"<p><b>Версия:</b> {VERSION}</p>"
             "<p><b>Протокол:</b> XMPP (Jabber)</p>"
             "<p><b>API:</b> REST</p>"
             "<ul>"
@@ -1982,19 +1984,27 @@ class XMPPGUI(QMainWindow):
     # ---- protected: имя/поведение не менять, меняются только виджеты внутри ----
 
     def refresh_chats_list(self):
-        rows = []
+        entries = []
         for contact, messages in self.chats.items():
             last_msg = messages[-1]["message"][:60] if messages else ""
             last_time = messages[-1]["time"] if messages else ""
-            rows.append({
-                "jid": contact,
-                "name": contact,
-                "preview": last_msg,
-                "time": last_time,
-                "unread": self.get_unread_count(contact),
-            })
-        # Свежие диалоги — выше, как и раньше подразумевал порядок вставки в dict
-        self.sidebar.set_chats(rows)
+            # Время последней активности: полный timestamp (ts) у новых сообщений,
+            # 0.0 — для старых диалогов без ts и пустых чатов (остаются внизу).
+            last_ts = messages[-1].get("ts", 0.0) if messages else 0.0
+            entries.append((
+                last_ts,
+                {
+                    "jid": contact,
+                    "name": contact,
+                    "preview": last_msg,
+                    "time": last_time,
+                    "unread": self.get_unread_count(contact),
+                },
+            ))
+        # Свежие диалоги — выше (сортировка стабильна: при равных ts сохраняется
+        # порядок вставки в self.chats).
+        entries.sort(key=lambda e: e[0], reverse=True)
+        self.sidebar.set_chats([row for _, row in entries])
 
     def get_unread_count(self, contact):
         if contact not in self.chats:
@@ -2051,6 +2061,7 @@ class XMPPGUI(QMainWindow):
                 'type': 'sent',
                 'message': message,
                 'time': datetime.now().strftime("%H:%M:%S"),
+                'ts': time.time(),
                 'status': 'sending',
                 'msg_id': msg_id,
             })
@@ -2202,6 +2213,7 @@ class XMPPGUI(QMainWindow):
                 'type': 'received',
                 'message': message,
                 'time': datetime.now().strftime("%H:%M:%S"),
+                'ts': time.time(),
                 'read': False,
                 'msg_id': msg_id,
             })
@@ -2367,6 +2379,7 @@ class XMPPGUI(QMainWindow):
                             'type': 'sent',
                             'message': message,
                             'time': datetime.now().strftime("%H:%M:%S"),
+                            'ts': time.time(),
                             'status': 'sending',
                             'msg_id': msg_id,
                         })
