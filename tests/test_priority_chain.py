@@ -9,19 +9,21 @@ from app.xmpp.native import SimpleXMPPClient
 from rest_server import RESTServer
 
 
-def _config():
-    return {"rest_api": {"host": "127.0.0.1", "port": 8080, "endpoint": "/send_message",
-                         "api_key": "", "allow_get": True}}
+def _config(**rest):
+    cfg = {"host": "127.0.0.1", "port": 8080, "endpoint": "/send_message",
+           "api_key": "", "allow_get": True}
+    cfg.update(rest)
+    return {"rest_api": cfg}
 
 
-def _server(handler, logger=None):
+def _server(handler, logger=None, **rest):
     calls = []
 
     def wrapped(*args):
         calls.append(args)
         return handler(*args)
 
-    server = RESTServer(_config(), message_handler=wrapped, message_logger=logger)
+    server = RESTServer(_config(**rest), message_handler=wrapped, message_logger=logger)
     return server.app.test_client(), calls
 
 
@@ -60,7 +62,7 @@ def test_queue_message_returns_id_and_keeps_priority():
     c, _ = _client()
     msg_id = c.queue_message("u@d", "hi", priority="high")
     uuid.UUID(msg_id)
-    assert c.message_queue.get_nowait() == ("u@d", "hi", msg_id, "high")
+    assert c.message_queue.get_nowait() == ("u@d", "hi", msg_id, "high", "text", None)
     given = c.queue_message("u@d", "x", msg_id="fixed-1")
     assert given == "fixed-1"
 
@@ -112,7 +114,7 @@ def test_rest_handler_failure_marks_failed_and_returns_id():
 
 
 def test_rest_priority_not_leaked_into_fallback_text():
-    client, calls = _server(lambda *a: True)
+    client, calls = _server(lambda *a: True, legacy_payload_as_message=True)
     client.post("/send_message", json={"to": "u@d", "priority": "high"})
     assert "priority" not in calls[0][1]
 
@@ -150,4 +152,3 @@ def test_native_log_updates_queued_row_not_duplicates():
         logger.log_message("SENT", "srv@d/res", "u@d", "hi", message_id=mid, priority="high")
         m = logger.get_message(mid)
         assert m["status"] == "sent" and m["recipient"] == "u@d" and m["sender"] == "srv@d/res"
-

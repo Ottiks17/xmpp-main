@@ -2317,7 +2317,8 @@ class XMPPGUI(QMainWindow):
                 QMessageBox.information(self, "Инфо", "REST API уже запущен")
                 return
 
-            def message_handler(to_user, message, priority="normal", msg_id=None):
+            def message_handler(to_user, message, priority="normal", msg_id=None,
+                                msg_type="text", payload=None):
                 """Вызывается из потока REST-сервера. GUI трогать нельзя!"""
                 try:
                     if self.xmpp_service is None:
@@ -2349,7 +2350,8 @@ class XMPPGUI(QMainWindow):
                     self.save_chat_history()
 
                     result = self.xmpp_service.send_message(
-                        to_user, message, msg_id=msg_id, priority=priority
+                        to_user, message, msg_id=msg_id, priority=priority,
+                        msg_type=msg_type, payload=payload,
                     )
 
                     self.sig_message_sent.emit(to_user, message, msg_id)

@@ -1,4 +1,3 @@
-
 """XMPP-сервис: по умолчанию нативный клиент (стабилен для локальных серверов)."""
 
 from __future__ import annotations
@@ -96,16 +95,20 @@ class XMPPService:
         message: str,
         msg_id: Optional[str] = None,
         priority: Optional[str] = None,
+        msg_type: str = "text",
+        payload: Optional[dict] = None,
     ):
         if not self.client or not self.client.is_connected:
             raise RuntimeError("Not connected to XMPP server")
         domain = self.config["xmpp"]["server"]
         to_jid = validate_jid(to_username, domain)
         if isinstance(self.client, SimpleXMPPClient):
-            return self.client.queue_message(to_jid, message, msg_id, priority)
-        # slixmpp-бэкенд ещё не знает про priority: отправляем как обычное сообщение
+            return self.client.queue_message(to_jid, message, msg_id, priority, msg_type, payload)
+        # slixmpp-бэкенд ещё не знает про priority и структурированные сообщения: уходит только текст
         if priority and priority != "normal" and self.log_callback:
             self.log_callback("slixmpp-бэкенд не поддерживает priority — отправлено как normal", "WARNING")
+        if msg_type != "text" and self.log_callback:
+            self.log_callback("slixmpp-бэкенд не поддерживает type=task/command — отправлен только текст", "WARNING")
         return self.client.queue_message(to_jid, message, msg_id)
 
     def register_user(self, username: str, password: str, email: Optional[str] = None) -> bool:
@@ -123,6 +126,3 @@ class XMPPService:
     def disconnect(self) -> None:
         if self.client:
             self.client.disconnect()
-
-
-

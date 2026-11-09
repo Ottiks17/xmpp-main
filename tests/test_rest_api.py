@@ -83,8 +83,24 @@ def test_send_message_bad_priority_returns_400():
         assert r.status_code == 400
 
 
-def test_send_message_payload_without_message_field_is_sent_as_json():
-    """Отсутствие поля message не даёт 400: остальной payload уходит JSON-строкой."""
+def test_send_message_without_message_field_returns_400_by_default():
+    """Контракт v1.0: нет текста — ошибка 400, а не JSON-дамп тела запроса в чат."""
+    calls = []
+
+    def handler(to_user, message, priority, msg_id):
+        calls.append(message)
+        return True
+
+    with tempfile.TemporaryDirectory() as tmp:
+        _, client, _ = _make_server(tmp, message_handler=handler)
+        r = _post(client, to="user@arsenal", custom="payload")
+        assert r.status_code == 400
+        assert r.get_json()["error"]["code"] == "bad_request"
+        assert calls == []
+
+
+def test_send_message_payload_without_message_field_legacy_mode_sends_json():
+    """Устаревший режим (rest_api.legacy_payload_as_message) сохраняет прежнее поведение."""
     calls = []
 
     def handler(to_user, message, priority, msg_id):
@@ -92,7 +108,7 @@ def test_send_message_payload_without_message_field_is_sent_as_json():
         return True
 
     with tempfile.TemporaryDirectory() as tmp:
-        _, client, _ = _make_server(tmp, message_handler=handler)
+        _, client, _ = _make_server(tmp, message_handler=handler, legacy_payload_as_message=True)
         r = _post(client, to="user@arsenal", custom="payload")
         assert r.status_code == 200
         assert json.loads(calls[0][1]) == {"to": "user@arsenal", "custom": "payload"}
@@ -134,9 +150,18 @@ def test_api_key_required():
                      headers={"X-API-Key": "secret"}).status_code == 200
 
 
-def test_api_key_via_query_param():
+def test_api_key_via_query_param_disabled_by_default():
+    """Контракт v1.0: ключ в URL по умолчанию не принимается (попадает в логи и прокси)."""
     with tempfile.TemporaryDirectory() as tmp:
         _, client, _ = _make_server(tmp, api_key="secret")
+        r = client.post("/send_message?api_key=secret",
+                        json={"to": "user@arsenal", "message": "hi"})
+        assert r.status_code == 401
+
+
+def test_api_key_via_query_param_when_allowed():
+    with tempfile.TemporaryDirectory() as tmp:
+        _, client, _ = _make_server(tmp, api_key="secret", allow_api_key_query=True)
         r = client.post("/send_message?api_key=secret",
                         json={"to": "user@arsenal", "message": "hi"})
         assert r.status_code == 200

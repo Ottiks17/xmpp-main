@@ -4,6 +4,8 @@
   v1 — исходная (id, type, sender, recipient, message, message_id, send_time,
        delivery_time, read_time, log_time) + индекс по message_id.
   v2 — priority (low/normal/high/critical) и status (queued/sent/delivered/read/failed).
+  v3 — контракт v1.0: external_id (идемпотентность), content_type (text/task/command),
+       payload (JSON); таблицы devices (реестр терминалов) и wakeup_confirms.
 """
 import json
 import os
@@ -66,8 +68,48 @@ def _migrate_v2(conn: sqlite3.Connection) -> None:
     conn.execute("CREATE INDEX IF NOT EXISTS idx_messages_priority ON messages(priority)")
 
 
+def _migrate_v3(conn: sqlite3.Connection) -> None:
+    """external_id / content_type / payload + реестр терминалов. Старые строки не меняются."""
+    columns = {row[1] for row in conn.execute("PRAGMA table_info(messages)")}
+    if "external_id" not in columns:
+        conn.execute("ALTER TABLE messages ADD COLUMN external_id TEXT")
+    if "content_type" not in columns:
+        conn.execute("ALTER TABLE messages ADD COLUMN content_type TEXT NOT NULL DEFAULT 'text'")
+    if "payload" not in columns:
+        conn.execute("ALTER TABLE messages ADD COLUMN payload TEXT")
+    # Один external_id — одно исходящее сообщение (идемпотентность запросов).
+    conn.execute(
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_messages_external_id ON messages(external_id) "
+        "WHERE external_id IS NOT NULL AND type = 'SENT'"
+    )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS devices (
+            device_id TEXT PRIMARY KEY,
+            xmpp_login TEXT,
+            xmpp_password_enc TEXT,
+            active INTEGER NOT NULL DEFAULT 1,
+            token_hash TEXT,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        )
+        """
+    )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS wakeup_confirms (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            device_id TEXT NOT NULL,
+            task_id TEXT NOT NULL,
+            confirmed_at TEXT NOT NULL
+        )
+        """
+    )
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_wakeup_confirms_task ON wakeup_confirms(task_id)")
+
+
 # (версия, функция). Новые миграции — только добавлять в конец.
-MIGRATIONS = [(1, _migrate_v1), (2, _migrate_v2)]
+MIGRATIONS = [(1, _migrate_v1), (2, _migrate_v2), (3, _migrate_v3)]
 SCHEMA_VERSION = MIGRATIONS[-1][0]
 
 
@@ -119,7 +161,7 @@ def migrate(db_path: str) -> int:
 
 _COLUMNS = (
     "id, type, sender, recipient, message, message_id, priority, status, "
-    "send_time, delivery_time, read_time, log_time"
+    "send_time, delivery_time, read_time, log_time, external_id, content_type, payload"
 )
 
 
@@ -167,10 +209,17 @@ class MessageLogger:
         message_id: str | None = None,
         priority: str | None = None,
         status: str | None = None,
+        external_id: str | None = None,
+        content_type: str = "text",
+        payload: dict | None = None,
     ) -> None:
         """Пишет строку. Для SENT с уже существующим message_id строка не дублируется,
-        а обновляется (REST создаёт её заранее со статусом queued)."""
+        а обновляется (REST создаёт её заранее со статусом queued).
+
+        Нарушение уникальности external_id (повторный запрос) пробрасывается как
+        sqlite3.IntegrityError — REST перед записью ищет дубликат через find_by_external_id."""
         priority = normalize_priority(priority)
+        payload_json = json.dumps(payload, ensure_ascii=False) if payload else None
         if status is None and msg_type == "SENT":
             status = "sent"
         with self.lock, closing(self._connect()) as conn:
@@ -193,8 +242,9 @@ class MessageLogger:
                 """
                 INSERT INTO messages
                 (type, sender, recipient, message, message_id, priority, status,
-                 send_time, delivery_time, read_time, log_time)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                 send_time, delivery_time, read_time, log_time,
+                 external_id, content_type, payload)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     msg_type, sender, recipient, message, message_id, priority, status,
@@ -202,6 +252,7 @@ class MessageLogger:
                     delivery_time.isoformat() if delivery_time else None,
                     read_time.isoformat() if read_time else None,
                     datetime.now().isoformat(),
+                    external_id, content_type, payload_json,
                 ),
             )
             conn.commit()
@@ -256,6 +307,33 @@ class MessageLogger:
             row = cur.fetchone()
             return _row_to_dict(cur, row) if row else None
 
+    def find_by_external_id(self, external_id: str) -> dict | None:
+        """Исходящее сообщение по external_id (идемпотентность запросов)."""
+        if not external_id:
+            return None
+        with self.lock, closing(self._connect()) as conn:
+            cur = conn.execute(
+                f"SELECT {_COLUMNS} FROM messages WHERE external_id = ? AND type = 'SENT' "
+                "ORDER BY id LIMIT 1",
+                (external_id,),
+            )
+            row = cur.fetchone()
+            return _row_to_dict(cur, row) if row else None
+
+    def get_messages_by_ids(self, message_ids: list[str]) -> list[dict]:
+        """Пакетный статус: строки исходящих сообщений по списку message_id."""
+        ids = [m for m in dict.fromkeys(message_ids) if m]
+        if not ids:
+            return []
+        placeholders = ",".join("?" * len(ids))
+        with self.lock, closing(self._connect()) as conn:
+            cur = conn.execute(
+                f"SELECT {_COLUMNS} FROM messages WHERE type = 'SENT' "
+                f"AND message_id IN ({placeholders}) ORDER BY id",
+                ids,
+            )
+            return [_row_to_dict(cur, r) for r in cur.fetchall()]
+
     def list_messages(
         self,
         limit: int = 100,
@@ -296,4 +374,3 @@ class MessageLogger:
 
 def _rank(status: str | None) -> int:
     return STATUS_RANK.get(status, -1)
-

@@ -42,6 +42,13 @@ def default_config() -> dict[str, Any]:
             "endpoint": "/send_message",
             "api_key": "",
             "allow_get": False,
+            # Контракт v1.0
+            "allow_api_key_query": False,        # ключ в ?api_key= (по умолчанию только заголовок X-API-Key)
+            "legacy_payload_as_message": False,  # старое поведение: тело запроса без message уходит как текст
+            "broadcast_max_recipients": 200,
+            "trusted_senders": [],               # JID доверенных отправителей для /v1/config/trusted-senders
+            "public_host": "",                   # apiHost в ответе /v1/auth/xmpp (пусто = хост запроса)
+            "public_port": 0,                    # apiPort в ответе /v1/auth/xmpp (0 = rest_api.port)
         },
         "kafka": {
             "enabled": False,
@@ -82,6 +89,21 @@ def apply_env_overrides(config: dict[str, Any]) -> dict[str, Any]:
         rest["host"] = os.getenv("REST_HOST")
     if os.getenv("REST_PORT"):
         rest["port"] = int(os.getenv("REST_PORT"))
+    for env_name, key in (
+        ("REST_ALLOW_GET", "allow_get"),
+        ("REST_ALLOW_API_KEY_QUERY", "allow_api_key_query"),
+        ("REST_LEGACY_PAYLOAD_AS_MESSAGE", "legacy_payload_as_message"),
+    ):
+        if os.getenv(env_name):
+            rest[key] = os.getenv(env_name).lower() in ("true", "1", "yes")
+    if os.getenv("REST_BROADCAST_MAX_RECIPIENTS"):
+        rest["broadcast_max_recipients"] = int(os.getenv("REST_BROADCAST_MAX_RECIPIENTS"))
+    if os.getenv("REST_PUBLIC_HOST"):
+        rest["public_host"] = os.getenv("REST_PUBLIC_HOST")
+    if os.getenv("REST_PUBLIC_PORT"):
+        rest["public_port"] = int(os.getenv("REST_PUBLIC_PORT"))
+    if os.getenv("REST_TRUSTED_SENDERS"):
+        rest["trusted_senders"] = [x.strip() for x in os.getenv("REST_TRUSTED_SENDERS").split(",") if x.strip()]
 
     kafka = config.setdefault("kafka", {})
     if os.getenv("KAFKA_ENABLED"):
@@ -133,4 +155,3 @@ def save_config(config: dict[str, Any], path: str = CONFIG_PATH) -> None:
     config_path.parent.mkdir(parents=True, exist_ok=True)
     with config_path.open("w", encoding="utf-8") as handle:
         json.dump(config, handle, ensure_ascii=False, indent=2)
-

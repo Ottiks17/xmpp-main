@@ -12,7 +12,13 @@
     "port": 8080,
     "endpoint": "/send_message",
     "api_key": "change-me-to-a-long-random-string",
-    "allow_get": false
+    "allow_get": false,
+    "allow_api_key_query": false,
+    "legacy_payload_as_message": false,
+    "broadcast_max_recipients": 200,
+    "trusted_senders": [],
+    "public_host": "",
+    "public_port": 0
   },
   "kafka": {
     "enabled": false,
@@ -33,4 +39,3 @@
     "retention_days": 14
   }
 }
-

@@ -1,4 +1,3 @@
-
 """Нативный XMPP-клиент (сокеты) — совместим с локальными серверами."""
 
 import base64
@@ -31,6 +30,28 @@ def _escape_xml(text):
         .replace('"', "&quot;")
         .replace("'", "&apos;")
     )
+
+
+def build_payload_xml(msg_type, payload):
+    """XML-элемент структурированного сообщения (контракт v1.0, раздел «Единая модель»).
+
+    text -> "" (только <body>); task -> <task kind id [subtype]><param name value/>...</task>;
+    command -> <command name [arg]/>. Значения экранируются; payload уже прошёл validate_payload."""
+    if msg_type == "task" and payload:
+        attrs = f'kind="{_escape_xml(payload["kind"])}" id="{_escape_xml(payload["task_id"])}"'
+        if payload.get("subtype"):
+            attrs += f' subtype="{_escape_xml(payload["subtype"])}"'
+        params = "".join(
+            f'<param name="{_escape_xml(k)}" value="{_escape_xml(v)}"/>'
+            for k, v in (payload.get("params") or {}).items()
+        )
+        return f'<task xmlns="{PRIORITY_NS}" {attrs}>{params}</task>' if params else f'<task xmlns="{PRIORITY_NS}" {attrs}/>'
+    if msg_type == "command" and payload:
+        attrs = f'name="{_escape_xml(payload["name"])}"'
+        if payload.get("arg"):
+            attrs += f' arg="{_escape_xml(payload["arg"])}"'
+        return f'<command xmlns="{PRIORITY_NS}" {attrs}/>'
+    return ""
 
 
 class SimpleXMPPClient:
@@ -232,7 +253,7 @@ class SimpleXMPPClient:
         time.sleep(1)
         return self.connect()
 
-    def send_message(self, to, message, msg_id=None, priority=None):
+    def send_message(self, to, message, msg_id=None, priority=None, msg_type="text", payload=None):
         """Send XMPP message with delivery receipts.
         
         Args:
@@ -240,6 +261,9 @@ class SimpleXMPPClient:
             message (str): Message text (max 256 chars)
             msg_id (str, optional): Message ID. Defaults to uuid4.
             priority (str, optional): low/normal/high/critical. Defaults to normal.
+            msg_type (str): text/task/command (контракт v1.0). Для task/command добавляется
+                элемент <task>/<command> в пространстве urn:wakeup:msg:0.
+            payload (dict, optional): уже проверенный validate_payload.
         
         Returns:
             str: Message ID if successful, None otherwise.
@@ -262,6 +286,7 @@ class SimpleXMPPClient:
                 f'<request xmlns="urn:xmpp:receipts"/>'
                 f'<markable xmlns="urn:xmpp:chat-markers:0"/>'
                 f'<priority xmlns="{PRIORITY_NS}" level="{priority}"/>'
+                f"{build_payload_xml(msg_type, payload)}"
                 f"</message>"
             )
             self._send_raw(msg_xml)
@@ -292,17 +317,17 @@ class SimpleXMPPClient:
             self._log(f"Ошибка отправки: {exc}", "ERROR")
             return None
 
-    def queue_message(self, to, message, msg_id=None, priority=None):
+    def queue_message(self, to, message, msg_id=None, priority=None, msg_type="text", payload=None):
         """Ставит сообщение в очередь и возвращает его ID (uuid4, если не задан)."""
         msg_id = msg_id or str(uuid.uuid4())
-        self.message_queue.put((to, message, msg_id, priority))
+        self.message_queue.put((to, message, msg_id, priority, msg_type, payload))
         return msg_id
 
     def _process_queue(self):
         while self.running and self.is_connected:
             try:
-                to, message, msg_id, priority = self.message_queue.get(timeout=1)
-                if self.send_message(to, message, msg_id, priority) is None and self.on_send_failed:
+                to, message, msg_id, priority, msg_type, payload = self.message_queue.get(timeout=1)
+                if self.send_message(to, message, msg_id, priority, msg_type, payload) is None and self.on_send_failed:
                     self.on_send_failed(msg_id)
             except Empty:
                 continue
@@ -504,7 +529,3 @@ class SimpleXMPPClient:
             except OSError:
                 pass
         self._log("Отключено", "INFO")
-
-
-
-

@@ -14,3 +14,19 @@ def test_load_config_returns_dict():
     assert "xmpp" in config
     assert "rest_api" in config
 
+
+def test_contract_v1_defaults_and_env_overrides(monkeypatch):
+    cfg = default_config()
+    assert cfg["rest_api"]["allow_api_key_query"] is False
+    assert cfg["rest_api"]["legacy_payload_as_message"] is False
+    assert cfg["rest_api"]["broadcast_max_recipients"] == 200
+
+    import os
+    for name, value in (("REST_ALLOW_API_KEY_QUERY", "true"), ("REST_TRUSTED_SENDERS", "a@d, b@d"),
+                        ("REST_BROADCAST_MAX_RECIPIENTS", "50")):
+        monkeypatch.setattr(os, "environ", {**os.environ, name: value})
+    from app.config import apply_env_overrides
+    out = apply_env_overrides(default_config())
+    assert out["rest_api"]["allow_api_key_query"] is True
+    assert out["rest_api"]["trusted_senders"] == ["a@d", "b@d"]
+    assert out["rest_api"]["broadcast_max_recipients"] == 50
