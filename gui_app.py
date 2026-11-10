@@ -2412,7 +2412,7 @@ class XMPPGUI(QMainWindow):
         if username and password:
             self.log_callback("Автоматическое подключение к XMPP...", "INFO")
             self.connect_xmpp()
-            QTimer.singleShot(3000, self.check_and_start_rest)
+            #QTimer.singleShot(3000, self.check_and_start_rest)
         else:
             self.log_callback("Настройки не сохранены. Автозапуск отключен.", "WARNING")
 

@@ -1,4 +1,4 @@
-"""Нативный XMPP-клиент (сокеты) — совместим с локальными серверами."""
+﻿"""Нативный XMPP-клиент (сокеты) — совместим с локальными серверами."""
 
 import base64
 import json
@@ -83,8 +83,6 @@ class SimpleXMPPClient:
         self.on_message_received = None
         self.on_delivery_received = None
         self.on_read_received = None
-        self.on_delivery_received = None
-        self.on_read_received = None
         self.on_send_failed = None
 
     def connect(self):
@@ -160,6 +158,7 @@ class SimpleXMPPClient:
         except Exception as exc:
             self._log(f"Auth error: {exc}", "ERROR")
             return False
+
     def _finalize_connection(self):
         self.resource = "".join(
             random.choices(string.ascii_lowercase + string.digits, k=8)
@@ -195,6 +194,7 @@ class SimpleXMPPClient:
 
         threading.Thread(target=self._process_queue, daemon=True).start()
         threading.Thread(target=self._read_loop, daemon=True).start()
+        threading.Thread(target=self._keepalive_loop, daemon=True).start()
 
     def register_user(self, username, password, email=None):
         if not self.is_connected:
@@ -232,26 +232,62 @@ class SimpleXMPPClient:
     def send_displayed_marker(self, to_jid, message_id):
         if not self.is_connected or not message_id:
             return
-        self._send_raw(
-            f'<message to="{_escape_xml(to_jid)}" type="chat">'
-            f'<displayed xmlns="urn:xmpp:chat-markers:0" id="{_escape_xml(message_id)}"/>'
-            f"</message>"
-        )
+        try:
+            self._send_raw(
+                f'<message to="{_escape_xml(to_jid)}" type="chat">'
+                f'<displayed xmlns="urn:xmpp:chat-markers:0" id="{_escape_xml(message_id)}"/>'
+                f"</message>"
+            )
+        except Exception:
+            pass
 
     def _receive_data(self):
         try:
+            if not self.socket:
+                return ""
             return self.socket.recv(8192).decode("utf-8", errors="ignore")
-        except OSError:
+        except (socket.timeout, OSError):
             return ""
 
     def _send_raw(self, data):
-        self.socket.send(f"{data}\n".encode("utf-8"))
+        if not self.socket:
+            return
+        try:
+            self.socket.send(f"{data}\n".encode("utf-8"))
+        except (BrokenPipeError, ConnectionResetError, OSError) as exc:
+            self._log(f"Сокет разорван ({exc}), переподключение...", "WARNING")
+            self.is_connected = False
+            try:
+                self.reconnect()
+                if self.socket and self.is_connected:
+                    self.socket.send(f"{data}\n".encode("utf-8"))
+            except Exception as exc2:
+                self._log(f"Не удалось переподключиться: {exc2}", "ERROR")
+                raise
 
     def reconnect(self):
         self.disconnect()
         self.running = True
         time.sleep(1)
         return self.connect()
+
+    def _keepalive_loop(self):
+        """XEP-0199 ping раз в 60 сек, чтобы сервер не разрывал сессию по idle-timeout."""
+        while self.running and self.is_connected:
+            try:
+                time.sleep(60)
+                if not self.is_connected or not self.socket:
+                    break
+                ping_id = f"ping_{int(time.time() * 1000)}"
+                self._send_raw(
+                    f'<iq type="get" id="{ping_id}" to="{self.server}">'
+                    f'<ping xmlns="urn:xmpp:ping"/></iq>'
+                )
+                self._log("Keep-alive ping отправлен", "DEBUG")
+            except Exception as exc:
+                self._log(f"Keep-alive ошибка: {exc}", "WARNING")
+                if not self.is_connected:
+                    break
 
     def send_message(self, to, message, msg_id=None, priority=None, msg_type="text", payload=None):
         """Send XMPP message with delivery receipts.
